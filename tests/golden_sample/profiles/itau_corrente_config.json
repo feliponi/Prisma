@@ -1,0 +1,23 @@
+{
+  "account_id": "itau_corrente",
+  "account_type": "bank_account",
+  "bank_name": "Itaú",
+  "invert_sign": false,
+  "column_map": {
+    "date": "Data",
+    "amount": "Valor",
+    "debit": null,
+    "credit": null,
+    "description": "Descricao",
+    "currency": null
+  },
+  "date_format": "%d/%m/%Y",
+  "decimal_separator": ",",
+  "thousands_separator": ".",
+  "encoding": "utf-8",
+  "delimiter": ";",
+  "amount_sign_convention": "signed",
+  "default_currency": "BRL",
+  "skip_rows_regex": "^(Saldo|Total|Balance)",
+  "internal_transfer_regex": "(?i)PAG.*FATURA|PGTO CARTAO|BILL PAYMENT"
+}

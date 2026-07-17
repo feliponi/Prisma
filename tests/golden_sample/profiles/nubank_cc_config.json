@@ -1,0 +1,23 @@
+{
+  "account_id": "nubank_cc",
+  "account_type": "credit_card",
+  "bank_name": "Nubank",
+  "invert_sign": true,
+  "column_map": {
+    "date": "date",
+    "amount": "amount",
+    "debit": null,
+    "credit": null,
+    "description": "description",
+    "currency": null
+  },
+  "date_format": "%Y-%m-%d",
+  "decimal_separator": ".",
+  "thousands_separator": ",",
+  "encoding": "utf-8",
+  "delimiter": ",",
+  "amount_sign_convention": "signed",
+  "default_currency": "BRL",
+  "skip_rows_regex": "^(Saldo|Total|Balance)",
+  "internal_transfer_regex": "(?i)PAG.*FATURA|PGTO CARTAO|BILL PAYMENT"
+}

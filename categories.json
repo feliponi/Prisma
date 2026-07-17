@@ -1,0 +1,19 @@
+{
+  "llm_categories": [
+    "Alimentação",
+    "Transporte",
+    "Moradia",
+    "Saúde",
+    "Educação",
+    "Lazer",
+    "Compras",
+    "Serviços",
+    "Salário",
+    "Investimentos",
+    "Outros"
+  ],
+  "system_categories": [
+    "Uncategorized",
+    "Transferência interna"
+  ]
+}

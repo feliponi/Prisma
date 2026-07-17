@@ -1,7 +1,16 @@
-"""Streamlit UI for the Personal Finance Management MVP.
-Orchestrates the pipeline: CSV upload -> column mapping -> sanitized preview
--> local AI categorization -> AI-generated budget conciliation insights.
-All user-facing text is in Brazilian Portuguese (pt_BR); code stays in English.
+"""Streamlit UI for the Personal Finance MVP.
+
+Contracts only (Phase 1). Every render/handler function below is fully
+type-hinted and documented but raises NotImplementedError; bodies land in
+Phase 2.
+
+Pipeline: Select/Create Account -> Upload -> Map -> Preview -> Categorize
+(spinner) -> Insights. UI is strictly separated from transform/AI logic:
+this module orchestrates calls into csv_mapper.py, ai_services.py, and
+db.py, and owns `st.session_state` only.
+
+All user-facing strings (labels, buttons, messages) MUST be pt_BR;
+identifiers/comments/logs stay English.
 """
 
 from __future__ import annotations
@@ -9,233 +18,176 @@ from __future__ import annotations
 import logging
 
 import pandas as pd
-import streamlit as st
 
-from ai_services import (
-    DEFAULT_CATEGORIES,
-    DEFAULT_MODEL,
-    DEFAULT_OLLAMA_URL,
-    categorize_transactions,
-    generate_financial_insights,
-)
-from csv_mapper import (
-    BankMappingConfig,
-    CANONICAL_COLUMNS,
-    list_saved_mappings,
-    load_mapping,
-    process_csv,
-    save_mapping,
-)
+from models import AccountProfile, SessionStateSchema
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-NEW_PROFILE_LABEL = "➕ Novo perfil de banco"
-
-st.set_page_config(page_title="Gestao Financeira Pessoal", layout="wide")
+NEW_ACCOUNT_LABEL = "+ Nova conta"
 
 
-def _init_session_state() -> None:
-    defaults = {
-        "raw_df": None,
-        "uploaded_file_bytes": None,
-        "processed_df": None,
-        "categorized_df": None,
-        "insights_text": None,
-        "selected_bank": None,
-    }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
+def init_session_state() -> None:
+    """Populate `st.session_state` with the SessionStateSchema defaults if unset.
+
+    Must be called once at the top of every script rerun before any other
+    render function reads session_state, so widget interactions never reset
+    pipeline state (uploaded file, mapping, sanitized/categorized data,
+    category cache, budgets).
+
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
 
 
-def _render_upload_section() -> None:
-    st.header("1. Importar extrato bancario (CSV)")
-    uploaded_file = st.file_uploader("Selecione o arquivo CSV do banco", type=["csv"])
+def render_account_selector() -> str | None:
+    """Render the account picker: an existing `account_id` or "+ Nova conta".
 
-    if uploaded_file is not None:
-        st.session_state["uploaded_file_bytes"] = uploaded_file.getvalue()
-        st.session_state["uploaded_file_name"] = uploaded_file.name
+    On selecting an existing account, loads its AccountProfile via
+    `csv_mapper.load_profile` into `session_state["bank_profile"]` and sets
+    `session_state["active_account_id"]`. On "+ Nova conta", clears
+    `active_account_id` so `render_account_creation_form` takes over.
 
+    Returns:
+        The selected account_id, or None while creating a new account.
 
-def _render_mapping_section() -> BankMappingConfig | None:
-    if st.session_state.get("uploaded_file_bytes") is None:
-        return None
-
-    st.header("2. Mapear colunas")
-
-    saved_banks = list_saved_mappings()
-    options = [NEW_PROFILE_LABEL] + saved_banks
-    choice = st.selectbox("Perfil de banco", options, key="bank_profile_choice")
-
-    import io
-
-    preview_buffer = io.BytesIO(st.session_state["uploaded_file_bytes"])
-    try:
-        header_preview = pd.read_csv(preview_buffer, nrows=5, dtype=str, engine="python")
-    except Exception as exc:  # noqa: BLE001 - surfaced directly to the user
-        st.error(f"Nao foi possivel ler o CSV enviado: {exc}")
-        return None
-
-    available_columns = list(header_preview.columns)
-    st.caption("Previa das primeiras linhas do arquivo:")
-    st.dataframe(header_preview, use_container_width=True)
-
-    if choice != NEW_PROFILE_LABEL:
-        existing_config = load_mapping(choice)
-        if existing_config is not None:
-            st.success(f"Perfil '{choice}' carregado automaticamente.")
-            return existing_config
-        st.warning("Nao foi possivel carregar o perfil selecionado. Configure manualmente.")
-
-    with st.form("mapping_form"):
-        bank_name = st.text_input("Nome do banco", value="" if choice == NEW_PROFILE_LABEL else choice)
-        date_column = st.selectbox("Coluna de data", available_columns)
-        amount_column = st.selectbox("Coluna de valor", available_columns)
-        description_column = st.selectbox("Coluna de descricao", available_columns)
-        decimal_separator = st.selectbox(
-            "Separador decimal", ["auto", ",", "."], help="'auto' detecta automaticamente"
-        )
-        csv_delimiter = st.text_input("Delimitador do CSV", value=",")
-        skip_rows = st.number_input("Linhas de cabecalho a ignorar", min_value=0, value=0, step=1)
-        save_profile = st.checkbox("Salvar este mapeamento para uso futuro", value=True)
-        submitted = st.form_submit_button("Aplicar mapeamento")
-
-    if not submitted:
-        return None
-
-    if not bank_name.strip():
-        st.error("Informe um nome de banco valido.")
-        return None
-
-    config = BankMappingConfig(
-        bank_name=bank_name.strip(),
-        date_column=date_column,
-        amount_column=amount_column,
-        description_column=description_column,
-        decimal_separator=decimal_separator,
-        csv_delimiter=csv_delimiter or ",",
-        skip_rows=int(skip_rows),
-    )
-
-    if save_profile:
-        try:
-            save_mapping(config)
-            st.success(f"Perfil de mapeamento salvo para '{config.bank_name}'.")
-        except OSError as exc:
-            st.error(f"Falha ao salvar o perfil de mapeamento: {exc}")
-
-    return config
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
 
 
-def _render_processing_section(config: BankMappingConfig) -> None:
-    import io
+def render_account_creation_form() -> AccountProfile | None:
+    """Render the new-account form: account_id, account_type, bank_name, locale,
+    sign convention, invert_sign, default_currency, internal_transfer_regex.
 
-    st.header("3. Previa dos dados sanitizados")
-    buffer = io.BytesIO(st.session_state["uploaded_file_bytes"])
+    On submit, builds an AccountProfile, persists it via
+    `csv_mapper.save_profile` and `db.upsert_account`, and sets it as the
+    active account in session_state.
 
-    try:
-        processed_df = process_csv(buffer, config)
-    except ValueError as exc:
-        st.error(f"Erro no mapeamento de colunas: {exc}")
-        return
-    except Exception as exc:  # noqa: BLE001 - surfaced directly to the user
-        st.error(f"Erro ao processar o CSV: {exc}")
-        return
+    Returns:
+        The newly created AccountProfile, or None until the form is submitted.
 
-    if processed_df.empty:
-        st.warning("Nenhuma transacao valida foi encontrada apos a sanitizacao dos dados.")
-        return
-
-    st.session_state["processed_df"] = processed_df
-    st.dataframe(processed_df, use_container_width=True)
-    st.caption(f"{len(processed_df)} transacoes validas encontradas.")
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
 
 
-def _render_categorization_section() -> None:
-    processed_df = st.session_state.get("processed_df")
-    if processed_df is None:
-        return
+def render_upload_section() -> bytes | None:
+    """Render the CSV file uploader, scoped to the active account.
 
-    st.header("4. Categorizacao automatica com IA local")
+    Returns:
+        The raw uploaded file bytes, or None if nothing has been uploaded
+        yet in this session for the active account.
 
-    col1, col2 = st.columns(2)
-    with col1:
-        model = st.text_input("Modelo Ollama", value=DEFAULT_MODEL)
-    with col2:
-        base_url = st.text_input("Endpoint Ollama", value=DEFAULT_OLLAMA_URL)
-
-    if st.button("Categorizar transacoes com IA"):
-        with st.spinner("Categorizando transacoes com o modelo local..."):
-            try:
-                categorized_df = categorize_transactions(
-                    processed_df,
-                    categories=DEFAULT_CATEGORIES,
-                    model=model,
-                    base_url=base_url,
-                )
-                st.session_state["categorized_df"] = categorized_df
-            except Exception as exc:  # noqa: BLE001 - surfaced directly to the user
-                st.error(f"Falha ao categorizar transacoes: {exc}")
-
-    categorized_df = st.session_state.get("categorized_df")
-    if categorized_df is not None:
-        st.dataframe(categorized_df, use_container_width=True)
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
 
 
-def _render_insights_section() -> None:
-    categorized_df = st.session_state.get("categorized_df")
-    if categorized_df is None:
-        return
+def render_mapping_section(raw_bytes: bytes) -> AccountProfile | None:
+    """Render CSV column mapping controls when the active account's profile
+    does not yet fully cover the uploaded file's columns.
 
-    st.header("5. Insights de conciliacao orcamentaria")
-    st.caption("Informe o orcamento planejado por categoria para gerar a analise.")
+    For an existing account profile, auto-applies the saved mapping without
+    prompting. For a fresh profile still being built (from
+    `render_account_creation_form`), presents column dropdowns bound to the
+    uploaded CSV's header row and persists the completed mapping.
 
-    spending_by_category = categorized_df.groupby("category")["amount"].sum().abs()
-    budget_inputs: dict[str, float] = {}
+    Args:
+        raw_bytes: The uploaded CSV's raw bytes, for header introspection.
 
-    with st.form("budget_form"):
-        for category in sorted(spending_by_category.index):
-            budget_inputs[category] = st.number_input(
-                f"Orcamento planejado - {category}",
-                min_value=0.0,
-                value=float(spending_by_category[category]),
-                step=50.0,
-            )
-        generate = st.form_submit_button("Gerar insights com IA")
+    Returns:
+        The AccountProfile to use for processing, or None until mapping is complete.
 
-    if generate:
-        with st.spinner("Gerando analise executiva com o modelo local..."):
-            insights_text = generate_financial_insights(
-                category_spending=spending_by_category.to_dict(),
-                category_budget=budget_inputs,
-            )
-            st.session_state["insights_text"] = insights_text
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
 
-    if st.session_state.get("insights_text"):
-        st.subheader("Resumo executivo")
-        st.write(st.session_state["insights_text"])
+
+def render_preview_section(raw_bytes: bytes, profile: AccountProfile) -> pd.DataFrame | None:
+    """Run `csv_mapper.process_csv` and display the sanitized transaction preview.
+
+    Persists the result to `session_state["sanitized_df"]` and, on user
+    confirmation, writes it to SQLite via `db.insert_transactions`
+    (idempotent — re-imports report zero new rows).
+
+    Args:
+        raw_bytes: The uploaded CSV's raw bytes.
+        profile: The resolved account profile to sanitize with.
+
+    Returns:
+        The sanitized DataFrame, or None if processing failed (error is
+        surfaced to the user via `st.error` in pt_BR).
+
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
+
+
+def render_categorization_section() -> pd.DataFrame | None:
+    """Trigger `ai_services.categorize_transactions` for the active account's
+    sanitized (non-internal-transfer) rows, showing a pt_BR loading spinner.
+
+    Reuses and updates `session_state["category_cache"]` so repeated
+    merchants across accounts are categorized once. Internal-transfer rows
+    keep their forced "Transferência interna" category and are skipped.
+
+    Returns:
+        The categorized DataFrame, or None until the user triggers
+        categorization or if the Ollama call fails (error surfaced in pt_BR).
+
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
+
+
+def render_budget_editor() -> dict[str, dict[str, float]]:
+    """Render per-category, per-currency budget input fields.
+
+    Persists edits to `session_state["budget_by_category"]`
+    (`{currency: {category: planned_amount}}`), the source of truth consumed
+    by `render_insights_section`.
+
+    Returns:
+        The current budget mapping after this render pass.
+
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
+
+
+def render_insights_section() -> None:
+    """Render the two insight views and trigger `ai_services.generate_financial_insights`.
+
+    Views:
+        (a) Per-account: spend vs. budget for the single active account.
+        (b) Consolidated: spend vs. budget aggregated across all accounts
+            sharing the same currency (never mixed across BRL/EUR).
+    Internal transfers are excluded from both. Displays a pt_BR loading
+    spinner while the Ollama call is in flight.
+
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
 
 
 def main() -> None:
-    st.title("Gestao Financeira Pessoal - MVP")
-    _init_session_state()
+    """Entry point: wires the full Select Account -> Upload -> Map -> Preview
+    -> Categorize -> Insights pipeline in order, gated on session_state so
+    each stage only renders once its prerequisite state is populated.
 
-    _render_upload_section()
-    config = _render_mapping_section()
-
-    if config is not None:
-        st.session_state["selected_bank"] = config
-    elif st.session_state.get("selected_bank") is not None and st.session_state.get(
-        "processed_df"
-    ) is None:
-        config = st.session_state["selected_bank"]
-
-    if st.session_state.get("selected_bank") is not None:
-        _render_processing_section(st.session_state["selected_bank"])
-
-    _render_categorization_section()
-    _render_insights_section()
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
 
 
 if __name__ == "__main__":

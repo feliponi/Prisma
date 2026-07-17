@@ -10,10 +10,12 @@
     "Serviços",
     "Salário",
     "Investimentos",
+    "Transferência interna",
+    "Impostos",
+    "Taxas e tarifas",
     "Outros"
   ],
   "system_categories": [
-    "Uncategorized",
-    "Transferência interna"
+    "Uncategorized"
   ]
 }

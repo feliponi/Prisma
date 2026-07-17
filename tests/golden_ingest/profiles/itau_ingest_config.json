@@ -1,0 +1,28 @@
+{
+  "account_id": "itau_ingest",
+  "account_type": "bank_account",
+  "bank_name": "Itau",
+  "invert_sign": false,
+  "column_map": {
+    "date": "Data",
+    "amount": "Valor",
+    "debit": null,
+    "credit": null,
+    "description": "Descricao",
+    "currency": null
+  },
+  "date_format": "%d/%m/%Y",
+  "decimal_separator": ",",
+  "thousands_separator": ".",
+  "encoding": "utf-8",
+  "delimiter": ";",
+  "amount_sign_convention": "signed",
+  "default_currency": "BRL",
+  "skip_rows_regex": "^(Saldo|Total|Balance)",
+  "internal_transfer_regex": "(?i)PAG.*FATURA|PGTO.*FATURA|PGTO CARTAO|BILL PAYMENT",
+  "source_type": "csv",
+  "sheet_name": null,
+  "header_row": 0,
+  "pdf_strategy": null,
+  "schema_fingerprint": "10228d471b47ddd9b2e072d08f23ce52ee9997895e99ed0b307a1970ab868a7f"
+}

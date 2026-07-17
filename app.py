@@ -22,6 +22,8 @@ import streamlit as st
 import ai_services
 import csv_mapper
 import db
+import file_ingest
+import mapping_ui
 from models import (
     AccountProfile,
     AccountType,
@@ -70,6 +72,15 @@ def init_session_state() -> None:
         "category_cache": {},
         "budget_by_category": {},
         "pending_new_account": None,
+        # --- Interactive-import pipeline keys (Phase 2 wiring) ------------
+        "raw_table": None,  # file_ingest.RawTable of the current upload
+        "suggested_mapping": None,  # mapping_ui.suggest_mapping output
+        "mapping_result": None,  # mapping_ui.MappingResult from the visual step
+        "header_row": 0,  # user-chosen header row index (Excel/PDF)
+        "selected_sheet": None,  # user-chosen Excel sheet name
+        "source_type": None,  # "csv" | "xls" | "pdf" of the current upload
+        "csv_dialect": None,  # file_ingest.CsvDialect after sniff + overrides
+        "pdf_extraction": None,  # file_ingest.PdfExtractionResult, if PDF
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -502,6 +513,126 @@ def render_insights_section() -> None:
     if insights_text:
         st.subheader("Resumo executivo")
         st.write(insights_text)
+
+
+# ---------------------------------------------------------------------------
+# Interactive-import pipeline (Phase 1 contracts — NOT yet wired into main()).
+#
+# These stubs describe the NEW pipeline order that will REPLACE the current
+# "Select/Create Account -> Upload -> Map" section in Phase 2:
+#
+#   1. Upload (CSV / XLS / XLSX / PDF)
+#   2. Ingest  -> file_ingest -> RawTable (+ CsvDialect / sheet / PDF review)
+#   3. Show detected columns + sample values
+#   4. Bind file to account (existing OR "Nova conta")
+#   5. Visual drag-and-drop mapping (mapping_ui.render_mapping_ui)
+#   6. Declare locale / sign / currency / internal_transfer_regex
+#   7. Validate + preview canonical DataFrame -> Save profile
+#
+# Categorize / Insights downstream stages are unchanged. main() is left on the
+# current working flow until these bodies land in Phase 2.
+# ---------------------------------------------------------------------------
+
+
+def render_file_ingest_section() -> "file_ingest.RawTable | None":
+    """Upload + ingest step: accept CSV/XLS/XLSX/PDF and produce a `RawTable`.
+
+    Dispatches on file type: CSV via `sniff_csv` (+ user-overridable dialect
+    widgets) -> `read_csv`; Excel via `list_excel_sheets` + sheet/header-row
+    pickers -> `read_excel`; PDF via strategy/header-row pickers -> `read_pdf`,
+    surfacing `PdfExtractionResult.warnings` and requiring confirmation when
+    `needs_manual_review` is True. Persists the result and its provenance
+    (`raw_table`, `source_type`, `csv_dialect`, `selected_sheet`,
+    `header_row`, `pdf_extraction`) to session_state.
+
+    Returns:
+        The ingested `RawTable`, or None until a file is ingested (or when a
+        PDF extraction still awaits manual review/abort).
+
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
+
+
+def render_column_preview(raw: "file_ingest.RawTable") -> None:
+    """Show the detected columns and sample values from an ingested `RawTable`.
+
+    Args:
+        raw: The ingested source-agnostic table to preview.
+
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
+
+
+def render_account_binding(raw: "file_ingest.RawTable") -> str | None:
+    """Bind the uploaded file to an account (existing or "Nova conta").
+
+    Computes `csv_mapper.compute_schema_fingerprint(raw.columns)` and, if
+    `csv_mapper.find_profile_by_fingerprint` matches a saved profile, offers a
+    one-click "Reaproveitar mapeamento salvo" that skips the visual mapping
+    step entirely.
+
+    Args:
+        raw: The ingested table whose column fingerprint is checked for reuse.
+
+    Returns:
+        The bound account_id, or None while a new account is being created.
+
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
+
+
+def render_visual_mapping_section(raw: "file_ingest.RawTable") -> "mapping_ui.MappingResult | None":
+    """Run the drag-and-drop mapping step and stash its `MappingResult`.
+
+    Seeds the buckets with `mapping_ui.suggest_mapping(raw.columns)`, renders
+    `mapping_ui.render_mapping_ui`, and persists the result to
+    `session_state["mapping_result"]`.
+
+    Args:
+        raw: The ingested table being mapped.
+
+    Returns:
+        The current `MappingResult`, or None until the user completes mapping.
+
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
+
+
+def render_mapping_validation_and_save(
+    raw: "file_ingest.RawTable",
+    mapping_result: "mapping_ui.MappingResult",
+    account_id: str,
+) -> "AccountProfile | None":
+    """Dry-run + validate the mapping on sample rows, then save the profile.
+
+    Assembles a candidate `AccountProfile` (mapping + locale + the import
+    provenance fields: `source_type`, `sheet_name`, `header_row`,
+    `pdf_strategy`, `schema_fingerprint`), dry-runs `csv_mapper.process_csv`
+    over `raw.sample_rows` to display parsed date / amount / sign / currency,
+    and refuses to save if parsing fails. On success persists via
+    `csv_mapper.save_profile` + `db.upsert_account`.
+
+    Args:
+        raw: The ingested table (its sample rows drive the dry run).
+        mapping_result: The validated mapping/locale declarations.
+        account_id: The bound account identifier.
+
+    Returns:
+        The saved `AccountProfile`, or None if validation failed or the user
+        has not confirmed the save.
+
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
 
 
 def main() -> None:

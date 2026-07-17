@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+mappings/*.json
+!mappings/.gitkeep
+data/
+*.db

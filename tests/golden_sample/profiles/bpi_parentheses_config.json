@@ -1,0 +1,23 @@
+{
+  "account_id": "bpi_parentheses",
+  "account_type": "bank_account",
+  "bank_name": "BPI",
+  "invert_sign": false,
+  "column_map": {
+    "date": "Data",
+    "amount": "Montante",
+    "debit": null,
+    "credit": null,
+    "description": "Descricao",
+    "currency": null
+  },
+  "date_format": "%Y-%m-%d",
+  "decimal_separator": ".",
+  "thousands_separator": ",",
+  "encoding": "utf-8",
+  "delimiter": ",",
+  "amount_sign_convention": "parentheses",
+  "default_currency": "EUR",
+  "skip_rows_regex": "^(Saldo|Total|Balance)",
+  "internal_transfer_regex": "(?i)PAG.*FATURA|PGTO CARTAO|BILL PAYMENT"
+}

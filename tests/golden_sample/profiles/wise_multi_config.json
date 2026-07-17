@@ -1,0 +1,23 @@
+{
+  "account_id": "wise_multi",
+  "account_type": "bank_account",
+  "bank_name": "Wise",
+  "invert_sign": false,
+  "column_map": {
+    "date": "Date",
+    "amount": "Amount",
+    "debit": null,
+    "credit": null,
+    "description": "Description",
+    "currency": "Currency"
+  },
+  "date_format": "%Y-%m-%d",
+  "decimal_separator": ".",
+  "thousands_separator": ",",
+  "encoding": "utf-8",
+  "delimiter": ",",
+  "amount_sign_convention": "signed",
+  "default_currency": "EUR",
+  "skip_rows_regex": "^(Saldo|Total|Balance)",
+  "internal_transfer_regex": "(?i)PAG.*FATURA|PGTO CARTAO|BILL PAYMENT"
+}

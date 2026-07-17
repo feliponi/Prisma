@@ -1,261 +1,268 @@
-"""Backend module for CSV bank-statement mapping configuration and sanitization.
+"""Backend module for account profile management and CSV sanitization.
 
-Handles dynamic column mapping between arbitrary bank CSV exports and the
-canonical internal data model (date, amount, description, category), persists
-per-bank mapping profiles as JSON, and sanitizes dirty CSV data (mixed date
-formats, Brazilian/US decimal separators, empty rows, embedded headers/footers).
+Contracts only (Phase 1). Every function below is fully type-hinted and
+documented but raises NotImplementedError; bodies land in Phase 2.
+
+Responsibilities:
+    - Persist/load per-account mapping profiles (`mappings/{account_id}_config.json`).
+    - Transform an arbitrary raw bank/card CSV into the canonical
+      `TransactionRecord` DataFrame: drop junk rows, parse dates and amounts
+      per the account's declared locale, resolve the amount sign (layout
+      convention, then `invert_sign`), resolve currency, tag internal
+      transfers, and stamp the idempotent `transaction_hash`.
+
+Does NOT persist to SQLite (see db.py) and does NOT call the LLM
+(see ai_services.py). UI concerns live in app.py only.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import pandas as pd
 
+from models import AccountProfile, DEFAULT_MAPPINGS_DIR
+
 logger = logging.getLogger(__name__)
 
-MAPPINGS_DIR = Path("mappings")
-CANONICAL_COLUMNS = ["date", "amount", "description", "category"]
-DEFAULT_CATEGORY = "Uncategorized"
 
-# Candidate date formats tried in order when parsing the `date` column.
-DATE_FORMATS = [
-    "%d/%m/%Y",
-    "%Y-%m-%d",
-    "%d-%m-%Y",
-    "%m/%d/%Y",
-    "%d/%m/%y",
-    "%Y/%m/%d",
-]
+def list_profiles(mappings_dir: Path = DEFAULT_MAPPINGS_DIR) -> list[str]:
+    """List account_ids for which a saved mapping profile exists on disk.
 
+    Args:
+        mappings_dir: Directory containing `{account_id}_config.json` files.
 
-@dataclass
-class BankMappingConfig:
-    """Represents a saved column mapping profile for a specific bank."""
+    Returns:
+        Account IDs sorted alphabetically. Empty list if the directory
+        does not exist or contains no valid profiles.
 
-    bank_name: str
-    date_column: str
-    amount_column: str
-    description_column: str
-    date_format_hint: str | None = None
-    decimal_separator: str = "auto"  # "auto", "," or "."
-    csv_delimiter: str = ","
-    encoding: str = "utf-8"
-    skip_rows: int = 0
-    extra: dict = field(default_factory=dict)
-
-    def to_dict(self) -> dict:
-        return {
-            "bank_name": self.bank_name,
-            "date_column": self.date_column,
-            "amount_column": self.amount_column,
-            "description_column": self.description_column,
-            "date_format_hint": self.date_format_hint,
-            "decimal_separator": self.decimal_separator,
-            "csv_delimiter": self.csv_delimiter,
-            "encoding": self.encoding,
-            "skip_rows": self.skip_rows,
-            "extra": self.extra,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "BankMappingConfig":
-        return cls(
-            bank_name=data["bank_name"],
-            date_column=data["date_column"],
-            amount_column=data["amount_column"],
-            description_column=data["description_column"],
-            date_format_hint=data.get("date_format_hint"),
-            decimal_separator=data.get("decimal_separator", "auto"),
-            csv_delimiter=data.get("csv_delimiter", ","),
-            encoding=data.get("encoding", "utf-8"),
-            skip_rows=data.get("skip_rows", 0),
-            extra=data.get("extra", {}),
-        )
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
 
 
-def _sanitize_filename(bank_name: str) -> str:
-    """Convert a bank name into a filesystem-safe slug for the config file."""
-    slug = "".join(c if c.isalnum() else "_" for c in bank_name.strip().lower())
-    return slug.strip("_") or "unnamed_bank"
+def load_profile(account_id: str, mappings_dir: Path = DEFAULT_MAPPINGS_DIR) -> AccountProfile | None:
+    """Load a previously saved account profile by its account_id.
+
+    Args:
+        account_id: The unique account identifier (e.g. "nubank_cc").
+        mappings_dir: Directory containing `{account_id}_config.json` files.
+
+    Returns:
+        The parsed AccountProfile, or None if no matching file exists or it
+        fails validation.
+
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
 
 
-def get_mapping_path(bank_name: str, mappings_dir: Path = MAPPINGS_DIR) -> Path:
-    """Return the JSON config path for a given bank name."""
-    return mappings_dir / f"{_sanitize_filename(bank_name)}_config.json"
+def save_profile(profile: AccountProfile, mappings_dir: Path = DEFAULT_MAPPINGS_DIR) -> Path:
+    """Persist an account profile as `{account_id}_config.json`.
 
+    Args:
+        profile: The account profile to save. `profile.account_id` determines
+            the filename; saving with an existing account_id overwrites it.
+        mappings_dir: Directory to write the JSON file into (created if absent).
 
-def list_saved_mappings(mappings_dir: Path = MAPPINGS_DIR) -> list[str]:
-    """List bank names for which a saved mapping profile exists."""
-    if not mappings_dir.exists():
-        return []
-    names = []
-    for path in sorted(mappings_dir.glob("*_config.json")):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            names.append(data.get("bank_name", path.stem))
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning("Failed to read mapping file %s: %s", path, exc)
-    return names
-
-
-def save_mapping(config: BankMappingConfig, mappings_dir: Path = MAPPINGS_DIR) -> Path:
-    """Persist a bank mapping configuration as a JSON file.
+    Returns:
+        The path the profile was written to.
 
     Raises:
         OSError: if the mappings directory cannot be created or written to.
+        NotImplementedError: Phase 2 implementation pending.
     """
-    mappings_dir.mkdir(parents=True, exist_ok=True)
-    path = get_mapping_path(config.bank_name, mappings_dir)
-    path.write_text(json.dumps(config.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
-    logger.info("Saved mapping profile for bank '%s' to %s", config.bank_name, path)
-    return path
+    raise NotImplementedError
 
 
-def load_mapping(bank_name: str, mappings_dir: Path = MAPPINGS_DIR) -> BankMappingConfig | None:
-    """Load a previously saved mapping configuration, or None if not found."""
-    path = get_mapping_path(bank_name, mappings_dir)
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return BankMappingConfig.from_dict(data)
-    except (OSError, json.JSONDecodeError, KeyError) as exc:
-        logger.error("Failed to load mapping for '%s': %s", bank_name, exc)
-        return None
+def process_csv(raw_bytes: bytes, profile: AccountProfile) -> pd.DataFrame:
+    """Transform a raw bank/card CSV export into the canonical transaction DataFrame.
 
-
-def _parse_date_series(series: pd.Series) -> pd.Series:
-    """Parse a string date series trying several known formats before a
-    generic fallback. Unparseable values become NaT."""
-    parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
-    remaining_mask = series.notna()
-
-    for fmt in DATE_FORMATS:
-        if not remaining_mask.any():
-            break
-        candidates = series[remaining_mask]
-        attempt = pd.to_datetime(candidates, format=fmt, errors="coerce")
-        success_mask = attempt.notna()
-        success_index = candidates.index[success_mask]
-        parsed.loc[success_index] = attempt[success_mask]
-        remaining_mask.loc[success_index] = False
-
-    if remaining_mask.any():
-        fallback = pd.to_datetime(series[remaining_mask], errors="coerce", dayfirst=True)
-        parsed.loc[fallback.index] = fallback
-
-    return parsed
-
-
-def _normalize_amount_value(raw_value: object, decimal_separator: str) -> str:
-    """Normalize a single amount string to a plain float-parsable string,
-    handling Brazilian (1.000,50) and US (1,000.50) thousand/decimal styles."""
-    if raw_value is None or (isinstance(raw_value, float) and pd.isna(raw_value)):
-        return ""
-    value = str(raw_value).strip()
-    value = value.replace("R$", "").replace("$", "").strip()
-    value = value.replace(" ", "")
-
-    is_negative = False
-    if value.startswith("(") and value.endswith(")"):
-        is_negative = True
-        value = value[1:-1]
-
-    if decimal_separator == "auto":
-        has_comma = "," in value
-        has_dot = "." in value
-        if has_comma and has_dot:
-            # Whichever separator appears last is the decimal separator.
-            if value.rfind(",") > value.rfind("."):
-                value = value.replace(".", "").replace(",", ".")
-            else:
-                value = value.replace(",", "")
-        elif has_comma:
-            # Comma-only: treat as decimal separator (Brazilian style).
-            value = value.replace(".", "").replace(",", ".")
-        # dot-only or neither: already float-compatible.
-    elif decimal_separator == ",":
-        value = value.replace(".", "").replace(",", ".")
-    elif decimal_separator == ".":
-        value = value.replace(",", "")
-
-    if is_negative and not value.startswith("-"):
-        value = f"-{value}"
-
-    return value
-
-
-def _parse_amount_series(series: pd.Series, decimal_separator: str) -> pd.Series:
-    """Parse an amount column of mixed string formats into floats."""
-    string_series = series.astype(str)
-    normalized = string_series.apply(lambda v: _normalize_amount_value(v, decimal_separator))
-    return pd.to_numeric(normalized, errors="coerce")
-
-
-def _drop_junk_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """Drop fully empty rows and rows that look like embedded headers/footers
-    (e.g. repeated header text or summary lines with no valid amount)."""
-    df = df.dropna(how="all")
-    df = df.dropna(subset=["date", "amount"], how="all")
-    return df
-
-
-def process_csv(
-    file_or_buffer,
-    config: BankMappingConfig,
-) -> pd.DataFrame:
-    """Read a raw bank CSV and transform it into the canonical DataFrame.
+    Pipeline (Phase 2):
+        1. Decode `raw_bytes` using `profile.encoding` and parse with
+           `profile.delimiter`.
+        2. Drop rows matching `profile.skip_rows_regex` (embedded
+           headers/footers, e.g. "Saldo Anterior") and fully empty rows.
+        3. Parse the date column per `profile.date_format`.
+        4. Parse the amount per `profile.amount_sign_convention`
+           ("signed" | "debit_credit_columns" | "parentheses"), using
+           `profile.decimal_separator` / `profile.thousands_separator`.
+        5. Apply `profile.invert_sign` AFTER layout resolution, to normalize
+           into the canonical convention (spend negative, income/refund
+           positive).
+        6. Resolve `currency`: read per-row from `column_map.currency` if
+           set (validated against the Currency enum, rejecting unknown
+           values), else use `profile.default_currency` for every row.
+        7. Tag `is_internal_transfer` via `profile.internal_transfer_regex`
+           against the description; when True, force
+           `category = "Transferência interna"`.
+        8. Stamp `account_id` / `account_type` from the profile.
+        9. Compute `transaction_hash` = sha256(
+               f"{account_id}|{date_iso}|{amount}|{currency}|{description_normalized}"
+           ) using `text_utils.normalize_description`.
 
     Args:
-        file_or_buffer: Path, file-like object, or buffer accepted by pandas.read_csv.
-        config: The bank mapping configuration describing source columns and formats.
+        raw_bytes: Raw CSV file content exactly as uploaded.
+        profile: The account profile describing how to parse this CSV.
 
     Returns:
-        A sanitized DataFrame with columns [date, amount, description, category].
+        A DataFrame with columns
+        [transaction_hash, account_id, account_type, date, amount, currency,
+         description, category, is_internal_transfer], matching
+        `models.TransactionRecord` field-for-field. `category` defaults to
+        "Uncategorized" except for internal-transfer rows.
 
     Raises:
-        ValueError: if required mapped columns are missing from the CSV.
+        ValueError: if a mapped column is missing from the CSV, or a
+            per-row currency value is not in the Currency enum.
+        UnicodeDecodeError: if `raw_bytes` cannot be decoded with
+            `profile.encoding`.
         pandas.errors.ParserError: if the CSV cannot be parsed at all.
+        NotImplementedError: Phase 2 implementation pending.
     """
-    try:
-        raw_df = pd.read_csv(
-            file_or_buffer,
-            delimiter=config.csv_delimiter,
-            encoding=config.encoding,
-            skiprows=config.skip_rows,
-            dtype=str,
-            engine="python",
-            skip_blank_lines=True,
-        )
-    except (pd.errors.ParserError, UnicodeDecodeError, OSError) as exc:
-        logger.error("Failed to read CSV for bank '%s': %s", config.bank_name, exc)
-        raise
+    raise NotImplementedError
 
-    raw_df.columns = [str(c).strip() for c in raw_df.columns]
 
-    required = [config.date_column, config.amount_column, config.description_column]
-    missing = [c for c in required if c not in raw_df.columns]
-    if missing:
-        raise ValueError(
-            f"Mapped columns not found in CSV for bank '{config.bank_name}': {missing}. "
-            f"Available columns: {list(raw_df.columns)}"
-        )
+def _drop_skip_rows(df: pd.DataFrame, skip_rows_regex: str) -> pd.DataFrame:
+    """Drop rows whose first column matches `skip_rows_regex`, plus fully-empty rows.
 
-    df = pd.DataFrame()
-    df["date"] = _parse_date_series(raw_df[config.date_column].astype(str).str.strip())
-    df["amount"] = _parse_amount_series(raw_df[config.amount_column], config.decimal_separator)
-    df["description"] = raw_df[config.description_column].astype(str).str.strip()
-    df["category"] = DEFAULT_CATEGORY
+    Args:
+        df: Raw DataFrame as read from the CSV, all-string dtype.
+        skip_rows_regex: Anchored regex (e.g. "^(Saldo|Total|Balance)")
+            identifying embedded header/footer rows to discard.
 
-    df = _drop_junk_rows(df)
-    df = df[df["description"].str.len() > 0]
-    df = df.reset_index(drop=True)
+    Returns:
+        The DataFrame with matching and empty rows removed.
 
-    logger.info(
-        "Processed CSV for bank '%s': %d valid transactions extracted", config.bank_name, len(df)
-    )
-    return df
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
+
+
+def _parse_date_column(series: pd.Series, date_format: str) -> pd.Series:
+    """Parse a raw string date column using the profile's declared format.
+
+    Args:
+        series: Raw date strings.
+        date_format: strptime-style format string, e.g. "%d/%m/%Y".
+
+    Returns:
+        A datetime64[ns] series. Unparseable values become NaT (and are
+        expected to be dropped by the caller).
+
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
+
+
+def _parse_decimal_series(
+    series: pd.Series, decimal_separator: str, thousands_separator: str
+) -> pd.Series:
+    """Parse a raw numeric-string column into floats using declared locale separators.
+
+    Args:
+        series: Raw amount strings (sign already stripped of layout markers
+            by the caller where applicable, e.g. parentheses).
+        decimal_separator: "," or "." — which character denotes the decimal point.
+        thousands_separator: "," or "." or "" — which character (if any) is
+            a thousands grouping separator to strip before float conversion.
+
+    Returns:
+        A float64 series. Unparseable values become NaN.
+
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
+
+
+def _resolve_amount(raw_df: pd.DataFrame, profile: AccountProfile) -> pd.Series:
+    """Resolve the canonical signed `amount` column from the raw CSV.
+
+    Dispatches on `profile.amount_sign_convention`:
+        - "signed": read `column_map.amount` directly (sign already present).
+        - "debit_credit_columns": debit values become negative, credit
+          values become positive, from `column_map.debit` / `column_map.credit`.
+        - "parentheses": "(1.234,56)"-style values become negative.
+    Then applies `profile.invert_sign` (multiplies the whole column by -1)
+    to normalize into the canonical convention.
+
+    Args:
+        raw_df: Raw DataFrame as read from the CSV.
+        profile: The account profile driving parsing rules.
+
+    Returns:
+        A float64 series of canonically-signed amounts, same index as raw_df.
+
+    Raises:
+        ValueError: if required amount/debit/credit columns are missing for
+            the declared convention.
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
+
+
+def _resolve_currency(raw_df: pd.DataFrame, profile: AccountProfile) -> pd.Series:
+    """Resolve the canonical `currency` column from the raw CSV.
+
+    Reads per-row from `column_map.currency` when set (validating each value
+    against the Currency enum and raising on anything else); otherwise fills
+    every row with `profile.default_currency`.
+
+    Args:
+        raw_df: Raw DataFrame as read from the CSV.
+        profile: The account profile driving currency resolution.
+
+    Returns:
+        A string series of ISO 4217 currency codes ("BRL" | "EUR").
+
+    Raises:
+        ValueError: if a per-row currency value is not in the Currency enum.
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
+
+
+def _tag_internal_transfers(description_series: pd.Series, internal_transfer_regex: str) -> pd.Series:
+    """Flag rows whose description matches the account's internal-transfer pattern.
+
+    Args:
+        description_series: Raw (pre-normalization) description strings.
+        internal_transfer_regex: Case-insensitive pattern identifying
+            card-bill payments and similar self-transfers (e.g. "PAG.*fatura").
+
+    Returns:
+        A boolean series, True where the description matches.
+
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
+
+
+def _compute_transaction_hash(
+    account_id: str, date_iso: str, amount: float, currency: str, description_normalized: str
+) -> str:
+    """Compute the idempotent primary-key hash for one transaction row.
+
+    Formula: sha256(f"{account_id}|{date_iso}|{amount}|{currency}|{description_normalized}").
+
+    Args:
+        account_id: The owning account's identifier.
+        date_iso: Transaction date formatted as "YYYY-MM-DD".
+        amount: Canonically-signed float amount.
+        currency: ISO 4217 currency code.
+        description_normalized: Output of `text_utils.normalize_description`.
+
+    Returns:
+        A 64-character lowercase hex SHA-256 digest.
+
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError

@@ -1,5 +1,4 @@
 """Streamlit UI for the Personal Finance Management MVP.
-
 Orchestrates the pipeline: CSV upload -> column mapping -> sanitized preview
 -> local AI categorization -> AI-generated budget conciliation insights.
 All user-facing text is in Brazilian Portuguese (pt_BR); code stays in English.

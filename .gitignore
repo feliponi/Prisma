@@ -5,3 +5,5 @@ mappings/*.json
 !mappings/.gitkeep
 data/
 *.db
+.agents/
+.claude/

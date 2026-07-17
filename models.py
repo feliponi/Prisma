@@ -80,12 +80,30 @@ class AccountProfile:
     internal_transfer_regex: str
 
     def to_dict(self) -> dict:
-        """Serialize this profile to a JSON-compatible dict.
-
-        Raises:
-            NotImplementedError: Phase 2 implementation pending.
-        """
-        raise NotImplementedError
+        """Serialize this profile to a JSON-compatible dict."""
+        return {
+            "account_id": self.account_id,
+            "account_type": self.account_type.value,
+            "bank_name": self.bank_name,
+            "invert_sign": self.invert_sign,
+            "column_map": {
+                "date": self.column_map.date,
+                "amount": self.column_map.amount,
+                "debit": self.column_map.debit,
+                "credit": self.column_map.credit,
+                "description": self.column_map.description,
+                "currency": self.column_map.currency,
+            },
+            "date_format": self.date_format,
+            "decimal_separator": self.decimal_separator,
+            "thousands_separator": self.thousands_separator,
+            "encoding": self.encoding,
+            "delimiter": self.delimiter,
+            "amount_sign_convention": self.amount_sign_convention.value,
+            "default_currency": self.default_currency.value,
+            "skip_rows_regex": self.skip_rows_regex,
+            "internal_transfer_regex": self.internal_transfer_regex,
+        }
 
     @classmethod
     def from_dict(cls, data: dict) -> "AccountProfile":
@@ -97,9 +115,32 @@ class AccountProfile:
         Raises:
             KeyError: if a required field is missing.
             ValueError: if an enum field holds an unrecognized value.
-            NotImplementedError: Phase 2 implementation pending.
         """
-        raise NotImplementedError
+        column_map_data = data["column_map"]
+        column_map = ColumnMap(
+            date=column_map_data["date"],
+            amount=column_map_data.get("amount"),
+            debit=column_map_data.get("debit"),
+            credit=column_map_data.get("credit"),
+            description=column_map_data["description"],
+            currency=column_map_data.get("currency"),
+        )
+        return cls(
+            account_id=data["account_id"],
+            account_type=AccountType(data["account_type"]),
+            bank_name=data["bank_name"],
+            invert_sign=bool(data["invert_sign"]),
+            column_map=column_map,
+            date_format=data["date_format"],
+            decimal_separator=data["decimal_separator"],
+            thousands_separator=data["thousands_separator"],
+            encoding=data["encoding"],
+            delimiter=data["delimiter"],
+            amount_sign_convention=AmountSignConvention(data["amount_sign_convention"]),
+            default_currency=Currency(data["default_currency"]),
+            skip_rows_regex=data["skip_rows_regex"],
+            internal_transfer_regex=data["internal_transfer_regex"],
+        )
 
 
 @dataclass(frozen=True)

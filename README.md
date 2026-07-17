@@ -78,15 +78,15 @@ Git).
 ## Estrutura do projeto
 
 ```
-models.py        # Modelos de dados canônicos (dataclasses, enums, TypedDicts)
-schema.sql        # DDL do SQLite (accounts, categories, transactions)
-categories.json    # Taxonomia de categorias (fonte única para DB e LLM)
-text_utils.py       # Normalização de descrição (usada no hash e no cache de IA)
-csv_mapper.py         # Perfis de conta + sanitização de CSV
-db.py                  # Persistência SQLite (import idempotente)
-ai_services.py           # Integração com Ollama (categorização + insights)
-app.py                    # Interface Streamlit (em pt_BR)
-mappings/                  # Perfis de mapeamento salvos por conta (JSON)
+models.py                   # Modelos de dados canônicos (dataclasses, enums, TypedDicts)
+schema.sql                  # DDL do SQLite (accounts, categories, transactions)
+categories.json             # Taxonomia de categorias (fonte única para DB e LLM)
+text_utils.py               # Normalização de descrição (usada no hash e no cache de IA)
+csv_mapper.py               # Perfis de conta + sanitização de CSV
+db.py                       # Persistência SQLite (import idempotente)
+ai_services.py              # Integração com Ollama (categorização + insights)
+app.py                      # Interface Streamlit (em pt_BR)
+mappings/                   # Perfis de mapeamento salvos por conta (JSON)
 tests/golden_sample/        # Fixture de aceitação: CSVs sujos + saída esperada
 ```
 

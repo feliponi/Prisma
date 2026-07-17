@@ -1,8 +1,5 @@
 """SQLite persistence layer for the Personal Finance MVP.
 
-Contracts only (Phase 1). Every function below is fully type-hinted and
-documented but raises NotImplementedError; bodies land in Phase 2.
-
 Owns the `accounts`, `categories`, and `transactions` tables (see schema.sql).
 Idempotent import is enforced here via `INSERT OR IGNORE` keyed on
 `transaction_hash`. No AI logic and no Streamlit imports belong in this module.
@@ -10,6 +7,7 @@ Idempotent import is enforced here via `INSERT OR IGNORE` keyed on
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from pathlib import Path
@@ -26,6 +24,8 @@ from models import (
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_SCHEMA_PATH = Path("schema.sql")
+
 
 def get_connection(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     """Open a SQLite connection with foreign keys enabled, creating the file if absent.
@@ -38,12 +38,14 @@ def get_connection(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
 
     Raises:
         sqlite3.Error: if the database file cannot be opened.
-        NotImplementedError: Phase 2 implementation pending.
     """
-    raise NotImplementedError
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def init_schema(conn: sqlite3.Connection, schema_path: Path = Path("schema.sql")) -> None:
+def init_schema(conn: sqlite3.Connection, schema_path: Path = DEFAULT_SCHEMA_PATH) -> None:
     """Create the `accounts`, `categories`, and `transactions` tables if absent.
 
     Args:
@@ -52,9 +54,10 @@ def init_schema(conn: sqlite3.Connection, schema_path: Path = Path("schema.sql")
 
     Raises:
         sqlite3.Error: if the DDL script fails to execute.
-        NotImplementedError: Phase 2 implementation pending.
     """
-    raise NotImplementedError
+    ddl = schema_path.read_text(encoding="utf-8")
+    conn.executescript(ddl)
+    conn.commit()
 
 
 def seed_categories(conn: sqlite3.Connection, categories_path: Path = DEFAULT_CATEGORIES_PATH) -> None:
@@ -69,9 +72,15 @@ def seed_categories(conn: sqlite3.Connection, categories_path: Path = DEFAULT_CA
     Raises:
         FileNotFoundError: if categories_path does not exist.
         json.JSONDecodeError: if categories.json is malformed.
-        NotImplementedError: Phase 2 implementation pending.
     """
-    raise NotImplementedError
+    taxonomy = json.loads(categories_path.read_text(encoding="utf-8"))
+    names = list(taxonomy["llm_categories"]) + list(taxonomy["system_categories"])
+    conn.executemany(
+        "INSERT OR IGNORE INTO categories (name) VALUES (?)",
+        [(name,) for name in names],
+    )
+    conn.commit()
+    logger.info("Seeded %d categories", len(names))
 
 
 def upsert_account(conn: sqlite3.Connection, profile: AccountProfile) -> None:
@@ -84,9 +93,18 @@ def upsert_account(conn: sqlite3.Connection, profile: AccountProfile) -> None:
 
     Raises:
         sqlite3.Error: on constraint violation or connection failure.
-        NotImplementedError: Phase 2 implementation pending.
     """
-    raise NotImplementedError
+    conn.execute(
+        """
+        INSERT INTO accounts (account_id, account_type, bank_name)
+        VALUES (?, ?, ?)
+        ON CONFLICT (account_id) DO UPDATE SET
+            account_type = excluded.account_type,
+            bank_name = excluded.bank_name
+        """,
+        (profile.account_id, profile.account_type.value, profile.bank_name),
+    )
+    conn.commit()
 
 
 def insert_transactions(conn: sqlite3.Connection, df: pd.DataFrame) -> int:
@@ -108,9 +126,41 @@ def insert_transactions(conn: sqlite3.Connection, df: pd.DataFrame) -> int:
     Raises:
         sqlite3.Error: on constraint violation (e.g. unknown category or
             unregistered account_id) or connection failure.
-        NotImplementedError: Phase 2 implementation pending.
     """
-    raise NotImplementedError
+    if df.empty:
+        return 0
+
+    rows = []
+    for _, row in df.iterrows():
+        date_value = row["date"]
+        date_iso = date_value.strftime("%Y-%m-%d") if hasattr(date_value, "strftime") else str(date_value)
+        rows.append(
+            (
+                row["transaction_hash"],
+                row["account_id"],
+                row["account_type"],
+                date_iso,
+                float(row["amount"]),
+                row["currency"],
+                row["description"],
+                row["category"],
+                int(bool(row["is_internal_transfer"])),
+            )
+        )
+
+    cursor = conn.executemany(
+        """
+        INSERT OR IGNORE INTO transactions (
+            transaction_hash, account_id, account_type, date, amount,
+            currency, description, category, is_internal_transfer
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    conn.commit()
+    inserted = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else 0
+    logger.info("Inserted %d new transactions (of %d rows submitted)", inserted, len(rows))
+    return inserted
 
 
 def fetch_accounts(conn: sqlite3.Connection) -> list[AccountSummary]:
@@ -121,11 +171,14 @@ def fetch_accounts(conn: sqlite3.Connection) -> list[AccountSummary]:
 
     Returns:
         All accounts, ordered by account_id.
-
-    Raises:
-        NotImplementedError: Phase 2 implementation pending.
     """
-    raise NotImplementedError
+    cursor = conn.execute(
+        "SELECT account_id, account_type, bank_name FROM accounts ORDER BY account_id"
+    )
+    return [
+        AccountSummary(account_id=row["account_id"], account_type=row["account_type"], bank_name=row["bank_name"])
+        for row in cursor.fetchall()
+    ]
 
 
 def fetch_transactions(
@@ -149,11 +202,43 @@ def fetch_transactions(
 
     Returns:
         A DataFrame matching `models.TransactionRecord` field-for-field.
-
-    Raises:
-        NotImplementedError: Phase 2 implementation pending.
     """
-    raise NotImplementedError
+    query = "SELECT * FROM transactions WHERE 1=1"
+    params: list = []
+    if account_id is not None:
+        query += " AND account_id = ?"
+        params.append(account_id)
+    if currency is not None:
+        query += " AND currency = ?"
+        params.append(currency)
+    if exclude_internal_transfers:
+        query += " AND is_internal_transfer = 0"
+    query += " ORDER BY date"
+
+    df = pd.read_sql_query(query, conn, params=params, parse_dates=["date"])
+    if "is_internal_transfer" in df.columns:
+        df["is_internal_transfer"] = df["is_internal_transfer"].astype(bool)
+    return df
+
+
+def update_categories(conn: sqlite3.Connection, category_by_hash: dict[str, str]) -> int:
+    """Persist LLM-resolved (or manually edited) categories back to the `transactions` table.
+
+    Args:
+        conn: An open SQLite connection.
+        category_by_hash: Mapping of transaction_hash -> new category name.
+
+    Returns:
+        The number of rows updated.
+    """
+    if not category_by_hash:
+        return 0
+    cursor = conn.executemany(
+        "UPDATE transactions SET category = ? WHERE transaction_hash = ?",
+        [(category, tx_hash) for tx_hash, category in category_by_hash.items()],
+    )
+    conn.commit()
+    return cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else 0
 
 
 def compute_spending_aggregates(
@@ -173,8 +258,30 @@ def compute_spending_aggregates(
     Returns:
         A list of SpendingAggregate, one per distinct (account_id, currency)
         pair covered by the query.
-
-    Raises:
-        NotImplementedError: Phase 2 implementation pending.
     """
-    raise NotImplementedError
+    query = """
+        SELECT account_id, currency, category, amount
+        FROM transactions
+        WHERE is_internal_transfer = 0 AND amount < 0
+    """
+    params: list = []
+    if account_id is not None:
+        query += " AND account_id = ?"
+        params.append(account_id)
+
+    df = pd.read_sql_query(query, conn, params=params)
+    if df.empty:
+        return []
+
+    df["spend"] = df["amount"].abs()
+    grouped = df.groupby(["account_id", "currency", "category"])["spend"].sum()
+
+    aggregates: dict[tuple[str, str], dict[str, float]] = {}
+    for (acc_id, currency, category), total in grouped.items():
+        key = (acc_id, currency)
+        aggregates.setdefault(key, {})[category] = float(total)
+
+    return [
+        SpendingAggregate(account_id=acc_id, currency=currency, category_totals=totals)
+        for (acc_id, currency), totals in sorted(aggregates.items())
+    ]

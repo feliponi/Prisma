@@ -1,0 +1,28 @@
+{
+  "account_id": "santander_ingest",
+  "account_type": "bank_account",
+  "bank_name": "Santander",
+  "invert_sign": false,
+  "column_map": {
+    "date": "Data",
+    "amount": null,
+    "debit": "Debito",
+    "credit": "Credito",
+    "description": "Historico",
+    "currency": null
+  },
+  "date_format": "%d/%m/%Y",
+  "decimal_separator": ",",
+  "thousands_separator": ".",
+  "encoding": "utf-8",
+  "delimiter": ";",
+  "amount_sign_convention": "debit_credit_columns",
+  "default_currency": "BRL",
+  "skip_rows_regex": "^(Saldo|Total|Balance)",
+  "internal_transfer_regex": "(?i)PAG.*FATURA|PGTO.*FATURA|PGTO CARTAO|BILL PAYMENT",
+  "source_type": "xls",
+  "sheet_name": "Extrato",
+  "header_row": 2,
+  "pdf_strategy": null,
+  "schema_fingerprint": "df7d787a2c27321b0c5cd9ffcf722bb63757d7b5b11c73f4f36f3d22f94520bc"
+}

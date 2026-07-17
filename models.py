@@ -78,6 +78,17 @@ class AccountProfile:
     default_currency: Currency
     skip_rows_regex: str
     internal_transfer_regex: str
+    # --- Import-provenance fields (additive, backward compatible) ---------
+    # Added by the interactive-import feature so a re-uploaded file of the
+    # same shape can reuse this profile in one click. All optional with
+    # defaults so profiles saved before this feature still load unchanged.
+    # NOTE: Phase 2 extends to_dict/from_dict to round-trip these keys; in
+    # Phase 1 they exist as the schema contract but are not yet (de)serialized.
+    source_type: str | None = None  # "csv" | "xls" | "pdf"
+    sheet_name: str | None = None  # Excel sheet name, else None
+    header_row: int = 0  # header row index (Excel/PDF); 0 for plain CSV
+    pdf_strategy: str | None = None  # "lattice" | "stream" | None
+    schema_fingerprint: str | None = None  # sha256 of sorted detected columns
 
     def to_dict(self) -> dict:
         """Serialize this profile to a JSON-compatible dict."""

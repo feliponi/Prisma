@@ -118,6 +118,52 @@ def save_profile(profile: AccountProfile, mappings_dir: Path = DEFAULT_MAPPINGS_
     return path
 
 
+def compute_schema_fingerprint(columns: list[str]) -> str:
+    """Compute a stable fingerprint of a file's column set for profile reuse.
+
+    Formula (contract — Phase 2 must match exactly so pre-saved fingerprints
+    stay comparable): sha256 over the newline-joined, case-sensitively sorted
+    detected column names:
+
+        sha256("\\n".join(sorted(columns)).encode("utf-8")).hexdigest()
+
+    Column ORDER does not affect the fingerprint (only the set/sorting does),
+    so the same bank export reused month to month fingerprints identically.
+
+    Args:
+        columns: Detected file column names (from `RawTable.columns`).
+
+    Returns:
+        A 64-character lowercase hex SHA-256 digest.
+
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
+
+
+def find_profile_by_fingerprint(
+    fingerprint: str, mappings_dir: Path = DEFAULT_MAPPINGS_DIR
+) -> AccountProfile | None:
+    """Find a saved profile whose stored `schema_fingerprint` matches.
+
+    Enables the one-click "Reaproveitar mapeamento salvo" path: on a new
+    upload the app computes the fingerprint and, if a saved profile matches,
+    offers to skip manual mapping entirely.
+
+    Args:
+        fingerprint: The uploaded file's `compute_schema_fingerprint` value.
+        mappings_dir: Directory containing `{account_id}_config.json` files.
+
+    Returns:
+        The first matching `AccountProfile`, or None if none match.
+
+    Raises:
+        NotImplementedError: Phase 2 implementation pending.
+    """
+    raise NotImplementedError
+
+
 def process_csv(raw_bytes: bytes, profile: AccountProfile) -> pd.DataFrame:
     """Transform a raw bank/card CSV export into the canonical transaction DataFrame.
 

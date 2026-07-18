@@ -20,6 +20,7 @@ import io
 import json
 import logging
 import sqlite3
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 
 import altair as alt
@@ -101,6 +102,7 @@ def init_session_state() -> None:
         "data_version": 0,
         "last_import_hashes": None,
         "last_import_account": None,
+        "corrected_hashes": (),
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -661,8 +663,21 @@ def _render_dashboard(conn: sqlite3.Connection) -> None:
     # ---- Running balance per account (currency never mixed) ----
     _render_balance_section(conn, currency, accounts_key, bounds, include_before, version)
 
+    # Table frame: INDEPENDENT query that INCLUDES internal transfers so they can
+    # be audited/edited. Separate cached call/SQL execution, fed ONLY to the table
+    # (the KPIs/charts/budgets below consume `df`, internal transfers excluded),
+    # so table visibility never leaks into any aggregation.
+    table_df = analytics.load_transactions(
+        version, currency, bounds.start, bounds.end,
+        accounts_key, tuple(sorted(selected_categories)), include_before,
+        exclude_internal_transfers=False,
+    )
+
     if df.empty:
-        st.info("Nenhuma transação no período/filtros selecionados.")
+        st.info("Nenhuma transação de gasto/receita no período (agregações vazias).")
+        # Still render the table so internal transfers stay auditable even when
+        # the period contains only internal-transfer rows.
+        _render_transaction_table(conn, table_df, currency)
         return
 
     # ---- KPI row ----
@@ -751,25 +766,36 @@ def _render_dashboard(conn: sqlite3.Connection) -> None:
                 f"{r.category} (+{_fmt_money(r.Estouro, currency)})" for r in overruns.itertuples()
             ))
 
-    # ---- Transaction table ----
-    _render_transaction_table(conn, df, currency)
+    # ---- Transaction table (uses the independent `table_df` computed above) ----
+    _render_transaction_table(conn, table_df, currency)
+
+
+_TABLE_IT_FILTERS = ["Todas", "Apenas transferências internas", "Excluir transferências internas"]
 
 
 def _render_transaction_table(conn: sqlite3.Connection, df: pd.DataFrame, currency: str) -> None:
     """Filtered, searchable, inline-editable transaction table with CSV export.
 
-    Uses the EFFECTIVE description (COALESCE(override, original)) for display,
-    search and export. The original bank text is immutable and shown in a
-    disabled 'Original (banco)' column; editing the 'Descrição' cell writes
+    The incoming `df` INCLUDES internal transfers (audit view). Uses the
+    EFFECTIVE description (COALESCE(override, original)) for display, search and
+    export. The original bank text is immutable and shown in a disabled
+    'Original (banco)' column; editing the 'Descrição' cell writes
     `description_override` only (setting it back to the original text clears the
-    override — "restaurar original"). `notes` are editable and searchable, and a
-    📝 flag marks rows that have notes. Notes are never sent to the LLM.
+    override). `notes` are editable/searchable, and a 📝 flag marks rows with
+    notes. Internal transfers carry a 🔁 marker and an EDITABLE 'Transf. interna'
+    checkbox: toggling it persists a manual override and keeps the category
+    coherent. Internal transfers are excluded from all spend metrics (they show
+    here only for auditing); notes are never sent to the LLM.
     """
     st.subheader("Transações")
-    s1, s2 = st.columns([2, 1])
+    st.caption("🔁 = transferência interna (excluída dos totais de gastos/receitas; "
+               "incluída nos saldos). Marque/desmarque 'Transf. interna' para corrigir a detecção.")
+    s1, s2, s3 = st.columns([2, 1, 1])
     search = s1.text_input("Buscar (descrição ou notas)", key="tbl_search").strip()
     focus_options = ["(todas)"] + sorted(df["category"].unique().tolist())
     focus = s2.selectbox("Focar em categoria", focus_options, key="tbl_focus")
+    # TABLE-level internal-transfer filter (downstream of aggregations only).
+    it_filter = s3.radio("Transferências internas", _TABLE_IT_FILTERS, key="table_it_filter")
 
     work = df.copy()
     work["notes"] = work["notes"].fillna("")
@@ -781,12 +807,23 @@ def _render_transaction_table(conn: sqlite3.Connection, df: pd.DataFrame, curren
         work = work[mask]
     if focus != "(todas)":
         work = work[work["category"] == focus]
+    if it_filter == "Apenas transferências internas":
+        work = work[work["is_internal_transfer"]]
+    elif it_filter == "Excluir transferências internas":
+        work = work[~work["is_internal_transfer"]]
+
+    if work.empty:
+        st.info("Nenhuma transação para os filtros selecionados.")
+        return
 
     view = pd.DataFrame({
+        "🔁": work["is_internal_transfer"].map(lambda v: "🔁" if v else ""),
         "📝": work["notes"].map(lambda n: "📝" if n else ""),
         "date": work["date"].dt.strftime("%Y-%m-%d"),
         "Descrição": work["description_effective"],
         "Original (banco)": work["description"],
+        "Transf. interna": work["is_internal_transfer"],
+        "Origem": work["internal_transfer_source"],
         "category": work["category"],
         "Notas": work["notes"],
         "amount": work["amount"],
@@ -799,24 +836,42 @@ def _render_transaction_table(conn: sqlite3.Connection, df: pd.DataFrame, curren
     edited = st.data_editor(
         view,
         column_config={
+            "🔁": st.column_config.TextColumn("🔁", disabled=True, width="small"),
             "📝": st.column_config.TextColumn("📝", disabled=True, width="small"),
             "date": st.column_config.TextColumn("Data", disabled=True),
             "Descrição": st.column_config.TextColumn(
                 "Descrição", help="Edite para sobrescrever o texto do banco; "
                 "volte ao texto original para restaurar."),
             "Original (banco)": st.column_config.TextColumn("Original (banco)", disabled=True),
+            "Transf. interna": st.column_config.CheckboxColumn(
+                "Transf. interna",
+                help="Marque para tratar como transferência interna (fora dos gastos); "
+                "desmarque para tratar como transação real."),
+            "Origem": st.column_config.TextColumn(
+                "Origem (transf.)", disabled=True,
+                help="regex = detectado automaticamente; manual = corrigido por você."),
             "category": st.column_config.SelectboxColumn("Categoria", options=all_categories, required=True),
             "Notas": st.column_config.TextColumn("Notas (local)", help="Nunca enviado à IA."),
             "amount": st.column_config.NumberColumn("Valor", disabled=True, format="%.2f"),
             "account_id": st.column_config.TextColumn("Conta", disabled=True),
-            "category_source": st.column_config.TextColumn("Origem", disabled=True),
+            "category_source": st.column_config.TextColumn("Origem (cat.)", disabled=True),
         },
         use_container_width=True, hide_index=True, key="tbl_editor",
     )
 
     if st.button("Salvar alterações", key="tbl_save"):
         changed = 0
+        corrected: list[str] = []  # rows toggled internal -> real (need categorization)
         for tx_hash in edited.index:
+            # Internal-transfer flag toggle (writes provenance + coherent category).
+            new_flag = bool(edited.loc[tx_hash, "Transf. interna"])
+            old_flag = bool(view.loc[tx_hash, "Transf. interna"])
+            flag_changed = new_flag != old_flag
+            if flag_changed:
+                db.set_internal_transfer_flag(conn, tx_hash, new_flag)
+                changed += 1
+                if not new_flag:  # True -> False: now a real transaction, needs a category
+                    corrected.append(tx_hash)
             new_desc = str(edited.loc[tx_hash, "Descrição"] or "").strip()
             original = str(view.loc[tx_hash, "Original (banco)"] or "").strip()
             cur_effective = str(view.loc[tx_hash, "Descrição"] or "").strip()
@@ -829,17 +884,50 @@ def _render_transaction_table(conn: sqlite3.Connection, df: pd.DataFrame, curren
                 db.set_notes(conn, tx_hash, new_notes or None)
                 changed += 1
             new_cat = edited.loc[tx_hash, "category"]
-            if new_cat != view.loc[tx_hash, "category"]:
+            # A flag toggle already set the category coherently; skip manual-category
+            # write for those rows to avoid clobbering it.
+            if not flag_changed and new_cat != view.loc[tx_hash, "category"]:
                 db.set_manual_category(conn, tx_hash, new_cat)  # durable: category_source='manual'
                 changed += 1
         if changed:
+            if corrected:
+                # Accumulate across saves until the user runs categorization.
+                prev = st.session_state.get("corrected_hashes") or ()
+                st.session_state["corrected_hashes"] = tuple(dict.fromkeys([*prev, *corrected]))
             _bump_data_version()
             st.success(f"{changed} alteração(ões) salva(s).")
             st.rerun()
         else:
             st.info("Nenhuma alteração para salvar.")
 
-    # Export: effective label + BOTH original and override + notes (raw text never lost).
+    # ---- Categorize rows that were just un-flagged (internal -> real) ----
+    corrected_hashes = st.session_state.get("corrected_hashes") or ()
+    if corrected_hashes:
+        st.caption(f"{len(corrected_hashes)} linha(s) corrigida(s) de transferência interna "
+                   "para transação real aguardam categorização.")
+        if st.button("Categorizar linhas corrigidas", key="tbl_cat_corrected"):
+            n = _categorize_hashes(conn, tuple(corrected_hashes))
+            st.session_state["corrected_hashes"] = ()
+            if n:
+                st.success(f"{n} linha(s) corrigida(s) categorizada(s).")
+            st.rerun()
+
+    # ---- Restore automatic (regex) detection for manual rows in this view ----
+    manual_rows = work[work["internal_transfer_source"] == "manual"]
+    if not manual_rows.empty:
+        with st.expander(f"Restaurar detecção automática ({len(manual_rows)} linha(s) manual(is) nesta visão)"):
+            st.caption("Reaplica o regex da conta a estas linhas, descartando a correção manual.")
+            if st.button("Restaurar detecção automática", key="tbl_restore_auto"):
+                restored, skipped = _restore_regex_detection(conn, manual_rows)
+                if restored:
+                    _bump_data_version()
+                    st.success(f"{restored} linha(s) restaurada(s) para detecção automática.")
+                if skipped:
+                    st.warning(f"{skipped} linha(s) ignorada(s): conta sem perfil de importação salvo.")
+                if restored:
+                    st.rerun()
+
+    # Export: effective label + BOTH original and override + notes + provenance.
     export = pd.DataFrame({
         "date": df["date"].dt.strftime("%Y-%m-%d"),
         "description_effective": df["description_effective"],
@@ -851,11 +939,37 @@ def _render_transaction_table(conn: sqlite3.Connection, df: pd.DataFrame, curren
         "currency": df["currency"],
         "account_id": df["account_id"],
         "is_internal_transfer": df["is_internal_transfer"],
+        "internal_transfer_source": df["internal_transfer_source"],
     })
     st.download_button(
         "Exportar visão filtrada (CSV)", data=export.to_csv(index=False).encode("utf-8"),
         file_name=f"transacoes_{currency}.csv", mime="text/csv", key="tbl_export",
     )
+
+
+def _restore_regex_detection(conn: sqlite3.Connection, manual_rows: pd.DataFrame) -> tuple[int, int]:
+    """Re-apply each account's regex to the given manual-override rows.
+
+    Regex evaluation is transform logic (csv_mapper); persistence is db. Rows
+    whose account has no saved import profile are skipped.
+
+    Returns:
+        (restored_count, skipped_count).
+    """
+    restored = skipped = 0
+    profile_cache: dict[str, object] = {}
+    for account_id, group in manual_rows.groupby("account_id"):
+        if account_id not in profile_cache:
+            profile_cache[account_id] = csv_mapper.load_profile(str(account_id))
+        profile = profile_cache[account_id]
+        if profile is None:
+            skipped += len(group)
+            continue
+        for tx_hash, description in zip(group["transaction_hash"], group["description"]):
+            matched = csv_mapper.matches_internal_transfer(str(description), profile.internal_transfer_regex)
+            db.reset_internal_transfer_to_regex(conn, tx_hash, matched)
+            restored += 1
+    return restored, skipped
 
 
 def _dashboard_page() -> None:
@@ -1013,6 +1127,104 @@ def _update_page() -> None:
 # ---------------------------------------------------------------------------
 # PAGE: Configurações
 # ---------------------------------------------------------------------------
+def _render_internal_transfer_settings(conn: sqlite3.Connection) -> None:
+    """Audit affordance for the internal-transfer regex (Part D).
+
+    Shows per-account regex + regex-vs-manual counts, a deep-link that opens the
+    Dashboard table pre-filtered to internal transfers, and a dry-run preview
+    before saving/applying a changed regex. A changed regex is NEVER auto-applied
+    to history and NEVER touches manual overrides.
+    """
+    st.header("Detecção de transferências internas")
+    accounts = db.list_all_accounts(conn)
+    if not accounts:
+        st.caption("Nenhuma conta cadastrada.")
+        return
+
+    target = st.selectbox("Conta", accounts, key="cfg_it_account")
+    profile = csv_mapper.load_profile(target)
+    if profile is None:
+        st.info(f"A conta '{target}' não possui perfil de importação salvo; "
+                "recrie-o para editar o regex de transferências internas.")
+        return
+
+    counts = db.internal_transfer_counts(conn, target)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Internas (regex)", counts["regex_internal"])
+    c2.metric("Internas (manual)", counts["manual_internal"])
+    c3.metric("Excluídas manualmente", counts["manual_excluded"])
+    st.caption(f"Regex atual: `{profile.internal_transfer_regex or '(vazio)'}`")
+
+    if st.button("Ver apenas transferências internas no painel", key="cfg_it_jump"):
+        # Preselect the Dashboard filters, then switch to it. Preselection applies
+        # even if the page switch is a no-op on this Streamlit version.
+        st.session_state["table_it_filter"] = "Apenas transferências internas"
+        st.session_state["dash_accounts"] = [target]
+        dashboard_page = st.session_state.get("_page_dashboard")
+        if dashboard_page is not None:
+            try:
+                st.switch_page(dashboard_page)
+            except Exception as exc:  # noqa: BLE001 - fall back to a hint
+                logger.warning("switch_page to dashboard failed: %s", exc)
+                st.info("Abra a página **Dashboard** para ver as linhas filtradas.")
+
+    # ---- Dry-run preview of a changed regex ----
+    st.subheader("Editar regex (com pré-visualização)")
+    new_regex = st.text_input(
+        "Novo regex de transferência interna", value=profile.internal_transfer_regex or "",
+        key="cfg_it_regex",
+    )
+    scan = db.fetch_transactions(conn, account_id=target, exclude_internal_transfers=False)
+    if st.button("Pré-visualizar correspondências", key="cfg_it_preview") and not scan.empty:
+        would_match = scan["description"].map(
+            lambda d: csv_mapper.matches_internal_transfer(str(d), new_regex)
+        )
+        preview = scan.assign(corresponde=would_match, protegida_manual=scan["internal_transfer_source"] == "manual")
+        matched_n = int(would_match.sum())
+        protected_n = int(preview["protegida_manual"].sum())
+        st.caption(
+            f"{matched_n} linha(s) corresponderiam ao novo regex. "
+            f"{protected_n} linha(s) manual(is) NÃO serão alteradas ao reaplicar."
+        )
+        st.dataframe(
+            preview[["date", "description", "is_internal_transfer", "internal_transfer_source", "corresponde"]]
+            .rename(columns={
+                "date": "Data", "description": "Descrição",
+                "is_internal_transfer": "Interna (atual)",
+                "internal_transfer_source": "Origem", "corresponde": "Corresponderia",
+            }),
+            use_container_width=True,
+        )
+
+    apply_history = st.checkbox(
+        "Reaplicar aos lançamentos históricos (exceto linhas manuais)", key="cfg_it_apply_hist",
+        help="Sem marcar, o regex é salvo apenas para importações futuras.",
+    )
+    if st.button("Salvar regex", key="cfg_it_save"):
+        # Persist to the profile (affects future imports) — never touches
+        # `description`/`transaction_hash`.
+        updated_profile = replace(profile, internal_transfer_regex=new_regex)
+        try:
+            csv_mapper.save_profile(updated_profile)
+        except OSError as exc:
+            st.error(f"Falha ao salvar o perfil: {exc}")
+            return
+        applied = 0
+        if apply_history and not scan.empty:
+            non_manual = scan[scan["internal_transfer_source"] != "manual"]
+            matched_by_hash = {
+                str(h): csv_mapper.matches_internal_transfer(str(d), new_regex)
+                for h, d in zip(non_manual["transaction_hash"], non_manual["description"])
+            }
+            applied = db.apply_regex_rescan(conn, target, matched_by_hash)
+            _bump_data_version()
+        msg = f"Regex da conta '{target}' salvo."
+        if apply_history:
+            msg += f" {applied} lançamento(s) histórico(s) reavaliado(s) (linhas manuais preservadas)."
+        st.success(msg)
+        st.rerun()
+
+
 def _render_settings(conn: sqlite3.Connection) -> None:
     st.title("⚙️ Configurações")
 
@@ -1097,6 +1309,9 @@ def _render_settings(conn: sqlite3.Connection) -> None:
             st.rerun()
     else:
         st.caption("Nenhum perfil salvo.")
+
+    # ---- Internal-transfer detection (audit + regex dry-run) ----
+    _render_internal_transfer_settings(conn)
 
     # ---- Category taxonomy ----
     st.header("Categorias")
@@ -1237,8 +1452,12 @@ def main() -> None:
         render_onboarding()
         return
 
+    dashboard_page = st.Page(_dashboard_page, title="Dashboard", icon="📊", default=True)
+    # Stored so the Configurações deep-link ("Ver apenas transferências internas
+    # no painel") can st.switch_page to it (this run's Page instance).
+    st.session_state["_page_dashboard"] = dashboard_page
     navigation = st.navigation([
-        st.Page(_dashboard_page, title="Dashboard", icon="📊", default=True),
+        dashboard_page,
         st.Page(_update_page, title="Atualizar transações", icon="⬆️"),
         st.Page(_patrimonio_page, title="Patrimônio", icon="💼"),
         st.Page(_settings_page, title="Configurações", icon="⚙️"),

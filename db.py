@@ -17,7 +17,9 @@ import pandas as pd
 
 from models import (
     DEFAULT_CATEGORIES_PATH,
+    DEFAULT_CATEGORY,
     DEFAULT_DB_PATH,
+    INTERNAL_TRANSFER_CATEGORY,
     AccountProfile,
     AccountSummary,
     SpendingAggregate,
@@ -162,6 +164,17 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
     if not _column_exists(conn, "transactions", "notes"):
         logger.info("Migration: adding transactions.notes")
         conn.execute("ALTER TABLE transactions ADD COLUMN notes TEXT")
+
+    # --- Internal-transfer provenance (regex vs manual override) ------------
+    # 'manual' rows are user corrections that must survive re-import / re-scan.
+    # The DEFAULT 'regex' back-fills every pre-existing row on ADD COLUMN
+    # (zero data loss, no rebuild required).
+    if not _column_exists(conn, "transactions", "internal_transfer_source"):
+        logger.info("Migration: adding transactions.internal_transfer_source")
+        conn.execute(
+            "ALTER TABLE transactions ADD COLUMN internal_transfer_source TEXT NOT NULL "
+            "DEFAULT 'regex' CHECK (internal_transfer_source IN ('regex', 'manual'))"
+        )
 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_transactions_before ON transactions (is_before_tracking)")
     conn.commit()
@@ -777,7 +790,8 @@ def fetch_transactions_filtered(
     query = (
         f"SELECT transaction_hash, account_id, account_type, date, amount, currency, "
         f"description, description_override, {EFFECTIVE_DESCRIPTION_SQL} AS description_effective, "
-        f"notes, category, is_internal_transfer, category_source, is_before_tracking "
+        f"notes, category, is_internal_transfer, internal_transfer_source, "
+        f"category_source, is_before_tracking "
         f"FROM transactions WHERE currency = ?"
     )
     params: list = [currency]
@@ -882,6 +896,173 @@ def fetch_categorizable(
         query += f" AND transaction_hash IN ({','.join('?' * len(only_hashes))})"
         params.extend(only_hashes)
     return pd.read_sql_query(query, conn, params=params)
+
+
+# ---------------------------------------------------------------------------
+# Internal-transfer flag (manual override + regex provenance)
+# ---------------------------------------------------------------------------
+# The internal-transfer flag can be set by the account's regex (source='regex')
+# or overridden by the user (source='manual'). A manual override is NEVER
+# reverted by a later import or regex re-scan. Toggling the flag keeps the
+# category coherent so no orphan state is left behind.
+def _internal_transfer_fields(is_internal: bool, source: str) -> tuple[int, str, str, str]:
+    """Compute the coherent (flag, source, category, category_source) tuple.
+
+    Keeps the category in sync with the flag so toggling never leaves orphan
+    state:
+        - flagged internal  -> forced category "Transferência interna"; its
+          category_source is 'manual' for a user override, else 'rule' (regex).
+        - not internal       -> reset to "Uncategorized" / category_source 'llm',
+          making the row eligible for (re-)categorization by the LLM.
+
+    Args:
+        is_internal: The target internal-transfer state.
+        source: 'manual' (user override) or 'regex' (auto-detected).
+
+    Returns:
+        (flag, internal_transfer_source, category, category_source).
+    """
+    if is_internal:
+        category_source = "manual" if source == "manual" else "rule"
+        return (1, source, INTERNAL_TRANSFER_CATEGORY, category_source)
+    return (0, source, DEFAULT_CATEGORY, "llm")
+
+
+def set_internal_transfer_flag(
+    conn: sqlite3.Connection, transaction_hash: str, is_internal: bool
+) -> None:
+    """Persist a user's manual override of the internal-transfer flag.
+
+    Stamps `internal_transfer_source = 'manual'` so the correction survives any
+    later import or regex re-scan, and keeps the category coherent:
+        - False -> True: category forced to "Transferência interna" and excluded
+          from LLM categorization (via the is_internal_transfer=0 gate in
+          fetch_categorizable).
+        - True -> False: category reset to "Uncategorized" / 'llm', making the
+          row eligible for categorization again. A previously-set manual category
+          is intentionally NOT resurrected (predictable behaviour).
+
+    Never touches `description` or `transaction_hash` (both immutable).
+
+    Raises:
+        sqlite3.Error: on connection failure (rolled back).
+    """
+    flag, source, category, category_source = _internal_transfer_fields(bool(is_internal), "manual")
+    try:
+        conn.execute(
+            "UPDATE transactions SET is_internal_transfer = ?, internal_transfer_source = ?, "
+            "category = ?, category_source = ? WHERE transaction_hash = ?",
+            (flag, source, category, category_source, transaction_hash),
+        )
+        conn.commit()
+        logger.info(
+            "Manual internal-transfer override: %s -> is_internal=%d (source=manual)",
+            transaction_hash, flag,
+        )
+    except sqlite3.Error:
+        conn.rollback()
+        logger.exception("Failed to set internal-transfer flag for %s", transaction_hash)
+        raise
+
+
+def reset_internal_transfer_to_regex(
+    conn: sqlite3.Connection, transaction_hash: str, matched: bool
+) -> None:
+    """Restore automatic (regex) detection for one row.
+
+    Clears the manual override: sets `internal_transfer_source = 'regex'` and the
+    flag to `matched` (the account regex's verdict, computed by the caller via
+    csv_mapper.matches_internal_transfer), keeping the category coherent.
+
+    Raises:
+        sqlite3.Error: on connection failure (rolled back).
+    """
+    flag, source, category, category_source = _internal_transfer_fields(bool(matched), "regex")
+    try:
+        conn.execute(
+            "UPDATE transactions SET is_internal_transfer = ?, internal_transfer_source = ?, "
+            "category = ?, category_source = ? WHERE transaction_hash = ?",
+            (flag, source, category, category_source, transaction_hash),
+        )
+        conn.commit()
+        logger.info(
+            "Restored regex detection: %s -> is_internal=%d (source=regex)",
+            transaction_hash, flag,
+        )
+    except sqlite3.Error:
+        conn.rollback()
+        logger.exception("Failed to restore regex detection for %s", transaction_hash)
+        raise
+
+
+def apply_regex_rescan(
+    conn: sqlite3.Connection, account_id: str, matched_by_hash: dict[str, bool]
+) -> int:
+    """Re-apply the internal-transfer regex to historical rows of one account.
+
+    Updates ONLY rows whose `internal_transfer_source != 'manual'`, so user
+    overrides are never reverted (enforced in the WHERE clause as a hard safety
+    net, independent of the caller's input). Keeps the category coherent per row.
+
+    Args:
+        conn: An open SQLite connection.
+        account_id: The account whose rows are being re-scanned.
+        matched_by_hash: transaction_hash -> regex verdict (True = internal),
+            computed by the caller via csv_mapper.matches_internal_transfer.
+
+    Returns:
+        The number of rows actually updated.
+
+    Raises:
+        sqlite3.Error: on connection failure (rolled back).
+    """
+    if not matched_by_hash:
+        return 0
+    params = []
+    for tx_hash, matched in matched_by_hash.items():
+        flag, source, category, category_source = _internal_transfer_fields(bool(matched), "regex")
+        params.append((flag, source, category, category_source, tx_hash, account_id))
+    try:
+        cursor = conn.executemany(
+            "UPDATE transactions SET is_internal_transfer = ?, internal_transfer_source = ?, "
+            "category = ?, category_source = ? "
+            "WHERE transaction_hash = ? AND account_id = ? AND internal_transfer_source != 'manual'",
+            params,
+        )
+        conn.commit()
+        updated = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+        logger.info("Regex re-scan for '%s' updated %d non-manual row(s)", account_id, updated)
+        return updated
+    except sqlite3.Error:
+        conn.rollback()
+        logger.exception("Failed regex re-scan for account '%s'", account_id)
+        raise
+
+
+def internal_transfer_counts(conn: sqlite3.Connection, account_id: str) -> dict[str, int]:
+    """Count internal-transfer rows for one account, split by provenance.
+
+    Returns:
+        dict with keys:
+            regex_internal  - flagged internal by regex (source='regex'),
+            manual_internal - flagged internal by a manual override,
+            manual_excluded - manually un-flagged (source='manual', flag=0).
+    """
+    row = conn.execute(
+        """
+        SELECT
+            COALESCE(SUM(CASE WHEN is_internal_transfer = 1 AND internal_transfer_source = 'regex'  THEN 1 ELSE 0 END), 0) AS regex_internal,
+            COALESCE(SUM(CASE WHEN is_internal_transfer = 1 AND internal_transfer_source = 'manual' THEN 1 ELSE 0 END), 0) AS manual_internal,
+            COALESCE(SUM(CASE WHEN is_internal_transfer = 0 AND internal_transfer_source = 'manual' THEN 1 ELSE 0 END), 0) AS manual_excluded
+        FROM transactions WHERE account_id = ?
+        """,
+        (account_id,),
+    ).fetchone()
+    return {
+        "regex_internal": int(row["regex_internal"]),
+        "manual_internal": int(row["manual_internal"]),
+        "manual_excluded": int(row["manual_excluded"]),
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -105,9 +105,17 @@ def load_transactions(
     account_ids: tuple[str, ...],
     categories: tuple[str, ...],
     include_before: bool = False,
+    exclude_internal_transfers: bool = True,
     db_path: str = str(DEFAULT_DB_PATH),
 ) -> pd.DataFrame:
-    """Load the filtered, single-currency, non-internal transactions (cached).
+    """Load the filtered, single-currency transactions (cached).
+
+    Aggregations (KPIs, charts, budgets) call this with the default
+    `exclude_internal_transfers=True` so internal transfers never enter spend
+    metrics. The transaction TABLE calls it with `exclude_internal_transfers=
+    False` to also surface those rows for auditing. Because the flag is part of
+    the cache key, the two callers get INDEPENDENT cache entries backed by
+    separate SQL executions — table visibility can never leak into aggregation.
 
     Args:
         data_version: Monotonic counter; changing it busts the cache after writes.
@@ -117,6 +125,8 @@ def load_transactions(
         categories: Categories to include (empty tuple = all).
         include_before: If True, also include pre-tracking rows (part of the
             cache key so the toggle busts the cache).
+        exclude_internal_transfers: If True (default), internal transfers are
+            excluded (aggregation path); if False, they are included (table path).
         db_path: Database path (part of the cache key).
 
     Returns:
@@ -131,7 +141,7 @@ def load_transactions(
             end_iso=end,
             account_ids=account_ids or None,
             categories=categories or None,
-            exclude_internal_transfers=True,
+            exclude_internal_transfers=exclude_internal_transfers,
             include_before=include_before,
         )
     finally:

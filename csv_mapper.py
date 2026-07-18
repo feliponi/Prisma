@@ -502,6 +502,26 @@ def _tag_internal_transfers(description_series: pd.Series, internal_transfer_reg
     return description_series.str.contains(pattern, regex=True, na=False)
 
 
+def matches_internal_transfer(description: str, internal_transfer_regex: str) -> bool:
+    """Return True if a single description matches the internal-transfer regex.
+
+    Public, row-level counterpart to `_tag_internal_transfers`, used by the UI
+    (regex re-scan / dry-run preview / "restaurar detecção automática"). Keeps
+    regex evaluation in the transform layer, out of db.py and app.py. Uses the
+    same case-insensitive semantics as the import path.
+
+    Args:
+        description: The row's (pre-normalization) description text.
+        internal_transfer_regex: The account's pattern (empty = never matches).
+
+    Returns:
+        True when the description matches the pattern, else False.
+    """
+    if not internal_transfer_regex:
+        return False
+    return re.search(internal_transfer_regex, description or "", re.IGNORECASE) is not None
+
+
 def _compute_transaction_hash(
     account_id: str, date_iso: str, amount: float, currency: str, description_normalized: str
 ) -> str:

@@ -64,10 +64,10 @@ _SIGN_CONVENTION_LABELS = {
 # case-insensitively). No LLM, no fuzzy service.
 HEURISTIC_SYNONYMS: dict[str, list[str]] = {
     "date": ["data", "date", "lancamento", "data lancamento", "dt", "data mov"],
-    "amount": ["valor", "amount", "montante", "valor (r$)", "value", "vlr"],
+    "amount": ["valor", "amount", "montante", "valor (r$)", "value", "vlr", "amount (eur)", "valor (eur)"],
     "debit": ["debito", "saida", "debit", "despesa", "pagamento"],
     "credit": ["credito", "entrada", "credit", "receita", "recebimento"],
-    "description": ["descricao", "historico", "description", "detalhe", "memo", "lancamento historico", "Partner Name"],
+    "description": ["descricao", "historico", "description", "detalhe", "memo", "lancamento historico", "partner name"],
     "reference": ["referencia", "complemento", "reference", "ref", "detalhe2", "payment reference"],
     "currency": ["moeda", "currency", "ccy", "divisa"],
 }
@@ -297,13 +297,13 @@ def render_mapping_ui(raw: RawTable, suggested: dict[str, str]) -> MappingResult
     col_a, col_b = st.columns(2)
     with col_a:
         date_format = st.text_input("Formato de data", value="%Y-%m-%d", key="map_date_format")
-        decimal_separator = st.selectbox("Separador decimal", [",", "."], key="map_decimal")
-        thousands_separator = st.selectbox("Separador de milhar", [".", ",", ""], key="map_thousands")
+        decimal_separator = st.selectbox("Separador decimal", [",", "."], key="map_decimal", index=1)
+        thousands_separator = st.selectbox("Separador de milhar", [".", ",", ""], key="map_thousands", index=2)
         invert_sign = st.checkbox(
             "Inverter sinal (ex.: cartão lista compras como positivo)", key="map_invert"
         )
     with col_b:
-        default_currency = st.selectbox("Moeda padrão", [c.value for c in Currency], key="map_currency")
+        default_currency = st.selectbox("Moeda padrão", [c.value for c in Currency], key="map_currency", index=1)
         skip_rows_regex = st.text_input(
             "Regex para ignorar linhas (rodapé/cabeçalho)",
             value="^(Saldo|Total|Balance)",

@@ -304,6 +304,7 @@ def _build_profile(binding: dict, mr: "mapping_ui.MappingResult", raw: file_inge
     column_map = ColumnMap(
         date=mr.mapping_dict.get("date"), amount=mr.mapping_dict.get("amount"),
         debit=mr.mapping_dict.get("debit"), credit=mr.mapping_dict.get("credit"),
+        reference=mr.mapping_dict.get("reference"),
         description=mr.mapping_dict.get("description"), currency=mr.mapping_dict.get("currency"),
     )
     return AccountProfile(

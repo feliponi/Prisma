@@ -34,7 +34,7 @@ from models import AmountSignConvention, Currency
 logger = logging.getLogger(__name__)
 
 # Canonical target fields ("app columns") a source column can be bound to.
-CANONICAL_TARGET_FIELDS = ["date", "amount", "debit", "credit", "description", "currency"]
+CANONICAL_TARGET_FIELDS = ["date", "amount", "debit", "credit", "description", "reference", "currency"]
 
 # pt_BR labels for the target buckets (UI only; keys stay English).
 TARGET_FIELD_LABELS_PT_BR: dict[str, str] = {
@@ -43,6 +43,7 @@ TARGET_FIELD_LABELS_PT_BR: dict[str, str] = {
     "debit": "Débito",
     "credit": "Crédito",
     "description": "Descrição",
+    "reference": "Referência (Complemento)",
     "currency": "Moeda",
 }
 _LABEL_TO_FIELD = {label: field_name for field_name, label in TARGET_FIELD_LABELS_PT_BR.items()}
@@ -66,7 +67,8 @@ HEURISTIC_SYNONYMS: dict[str, list[str]] = {
     "amount": ["valor", "amount", "montante", "valor (r$)", "value", "vlr"],
     "debit": ["debito", "saida", "debit", "despesa", "pagamento"],
     "credit": ["credito", "entrada", "credit", "receita", "recebimento"],
-    "description": ["descricao", "historico", "description", "detalhe", "memo", "lancamento historico"],
+    "description": ["descricao", "historico", "description", "detalhe", "memo", "lancamento historico", "Partner Name"],
+    "reference": ["referencia", "complemento", "reference", "ref", "detalhe2", "payment reference"],
     "currency": ["moeda", "currency", "ccy", "divisa"],
 }
 
@@ -157,8 +159,8 @@ def suggest_mapping(columns: list[str]) -> dict[str, str]:
 def _visible_fields(amount_sign_convention: str) -> list[str]:
     """Return the canonical fields to show for a given sign convention."""
     if amount_sign_convention == AmountSignConvention.DEBIT_CREDIT_COLUMNS.value:
-        return ["date", "description", "debit", "credit", "currency"]
-    return ["date", "description", "amount", "currency"]
+        return ["date", "description", "debit", "credit", "reference", "currency"]
+    return ["date", "description", "amount", "reference", "currency"]
 
 
 def _required_fields(amount_sign_convention: str) -> list[str]:
@@ -294,7 +296,7 @@ def render_mapping_ui(raw: RawTable, suggested: dict[str, str]) -> MappingResult
     st.markdown("**Localização e regras**")
     col_a, col_b = st.columns(2)
     with col_a:
-        date_format = st.text_input("Formato de data", value="%d/%m/%Y", key="map_date_format")
+        date_format = st.text_input("Formato de data", value="%Y-%m-%d", key="map_date_format")
         decimal_separator = st.selectbox("Separador decimal", [",", "."], key="map_decimal")
         thousands_separator = st.selectbox("Separador de milhar", [".", ",", ""], key="map_thousands")
         invert_sign = st.checkbox(

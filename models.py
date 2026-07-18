@@ -52,6 +52,7 @@ class ColumnMap:
     debit: str | None
     credit: str | None
     description: str
+    reference: str | None
     currency: str | None
 
 
@@ -103,6 +104,7 @@ class AccountProfile:
                 "debit": self.column_map.debit,
                 "credit": self.column_map.credit,
                 "description": self.column_map.description,
+                "reference": self.column_map.reference,
                 "currency": self.column_map.currency,
             },
             "date_format": self.date_format,
@@ -140,6 +142,7 @@ class AccountProfile:
             debit=column_map_data.get("debit"),
             credit=column_map_data.get("credit"),
             description=column_map_data["description"],
+            reference=column_map_data.get("reference"),
             currency=column_map_data.get("currency"),
         )
         return cls(

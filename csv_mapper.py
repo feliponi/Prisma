@@ -18,11 +18,12 @@ import hashlib
 import io
 import json
 import logging
+import profile
 import re
-from pathlib import Path
-
+import numpy as np
 import pandas as pd
 
+from pathlib import Path
 from models import (
     AccountProfile,
     AmountSignConvention,
@@ -269,7 +270,20 @@ def process_csv(raw_bytes: bytes, profile: AccountProfile) -> pd.DataFrame:
     date_series = _parse_date_column(raw_df[profile.column_map.date].astype(str).str.strip(), profile.date_format)
     amount_series = _resolve_amount(raw_df, profile)
     currency_series = _resolve_currency(raw_df, profile)
-    description_series = raw_df[profile.column_map.description].astype(str).str.strip()
+    description_series = raw_df[profile.column_map.description].fillna("").astype(str).str.strip()
+
+    # Concatenar a coluna de referência, se mapeada
+    if getattr(profile.column_map, "reference", None) and profile.column_map.reference in raw_df.columns:
+        reference_series = raw_df[profile.column_map.reference].astype(str).str.strip()    
+
+        # Identifica onde a referência é válida
+        mask_valid_ref = (
+            reference_series.notna()
+            & reference_series.ne("")
+        )
+        
+        # SOLUÇÃO: Usa indexação direta (.loc) para atualizar apenas as 85 linhas válidas.
+        description_series.loc[mask_valid_ref] = description_series.loc[mask_valid_ref] + " - " + reference_series.loc[mask_valid_ref]
 
     canonical_df = pd.DataFrame(
         {
@@ -279,9 +293,13 @@ def process_csv(raw_bytes: bytes, profile: AccountProfile) -> pd.DataFrame:
             "description": description_series,
         }
     )
+    
+    # canonical_df.to_csv("debug_canonical_df_before_dropna.csv", index=False)  # Salva o DataFrame antes do dropna para depuração
+    
     canonical_df = canonical_df.dropna(subset=["date", "amount"])
-    canonical_df = canonical_df[canonical_df["description"].str.len() > 0]
+    canonical_df = canonical_df = canonical_df[canonical_df["description"].fillna("").str.len() > 0]
     canonical_df = canonical_df.reset_index(drop=True)
+
 
     if canonical_df.empty:
         return pd.DataFrame(columns=CANONICAL_COLUMNS)
@@ -341,7 +359,7 @@ def _parse_date_column(series: pd.Series, date_format: str) -> pd.Series:
 
     Args:
         series: Raw date strings.
-        date_format: strptime-style format string, e.g. "%d/%m/%Y".
+        date_format: strptime-style format string, e.g. "%Y-%m-%d".
 
     Returns:
         A datetime64[ns] series. Unparseable values become NaT (and are

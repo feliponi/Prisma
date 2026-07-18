@@ -662,15 +662,28 @@ def _render_dashboard(conn: sqlite3.Connection) -> None:
 
     # ---- KPI row ----
     kpi, prev = analytics.compute_kpis(df), analytics.compute_kpis(prev_df)
+    # Running-balance KPI: same currency accounts as the balance section, so the
+    # KPI matches "Saldo por conta" and never mixes BRL/EUR. Balance INCLUDES
+    # internal transfers + the opening balance (unlike despesas/receitas).
+    currency_accounts = tuple(
+        a for a in (accounts_key or tuple(db.list_all_accounts(conn)))
+        if (db.get_account(conn, a) or {}).get("currency") == currency
+    )
+    saldo = db.balance_as_of(conn, currency_accounts, currency, bounds.end)
+    saldo_prev = db.balance_as_of(conn, currency_accounts, currency, bounds.prev_end)
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Total de despesas", _fmt_money(kpi["expenses"], currency),
               delta=_delta_str(kpi["expenses"], prev["expenses"]), delta_color="inverse")
     k2.metric("Total de receitas", _fmt_money(kpi["income"], currency),
               delta=_delta_str(kpi["income"], prev["income"]))
-    k3.metric("Saldo líquido", _fmt_money(kpi["net"], currency),
-              delta=_delta_str(kpi["net"], prev["net"]))
-    k4.metric("Δ despesas vs. período anterior",
-              _delta_str(kpi["expenses"], prev["expenses"]) or "—")
+    k3.metric("Saldo atual", _fmt_money(saldo, currency),
+              delta=_delta_str(saldo, saldo_prev),
+              help="Saldo real da(s) conta(s) na moeda selecionada, incluindo o "
+                   "saldo inicial e transferências internas, no fim do período.")
+    k4.metric("Resultado do período", _fmt_money(kpi["net"], currency),
+              delta=_delta_str(kpi["net"], prev["net"]),
+              help="Receitas menos despesas do período (não inclui saldo inicial "
+                   "nem transferências internas).")
 
     # ---- Chart 1: monthly evolution (income/expense bars + net line) ----
     st.subheader("Evolução mensal")

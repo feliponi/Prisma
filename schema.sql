@@ -23,10 +23,22 @@ CREATE TABLE IF NOT EXISTS transactions (
     currency              TEXT NOT NULL CHECK (currency IN ('BRL', 'EUR')),
     description            TEXT NOT NULL,
     category                TEXT NOT NULL DEFAULT 'Uncategorized' REFERENCES categories (name),
-    is_internal_transfer     INTEGER NOT NULL DEFAULT 0 CHECK (is_internal_transfer IN (0, 1))
+    is_internal_transfer     INTEGER NOT NULL DEFAULT 0 CHECK (is_internal_transfer IN (0, 1)),
+    -- Provenance of the category: 'llm' (auto), 'manual' (user edit, never
+    -- overwritten by a later LLM run), or 'rule' (forced, e.g. internal transfer).
+    category_source          TEXT NOT NULL DEFAULT 'llm' CHECK (category_source IN ('llm', 'manual', 'rule'))
+);
+
+-- Planned budget per (category, currency). BRL and EUR are never mixed.
+CREATE TABLE IF NOT EXISTS budgets (
+    category        TEXT NOT NULL REFERENCES categories (name),
+    currency        TEXT NOT NULL CHECK (currency IN ('BRL', 'EUR')),
+    planned_amount  REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (category, currency)
 );
 
 CREATE INDEX IF NOT EXISTS idx_transactions_account_id ON transactions (account_id);
 CREATE INDEX IF NOT EXISTS idx_transactions_account_type ON transactions (account_type);
 CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions (date);
 CREATE INDEX IF NOT EXISTS idx_transactions_currency ON transactions (currency);
+CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions (category);

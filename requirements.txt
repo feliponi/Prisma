@@ -1,5 +1,6 @@
-streamlit>=1.32
+streamlit>=1.36
 pandas>=2.0
+altair>=5.0
 ollama>=0.3
 openpyxl>=3.1
 pdfplumber>=0.11

@@ -118,6 +118,24 @@ def save_profile(profile: AccountProfile, mappings_dir: Path = DEFAULT_MAPPINGS_
     return path
 
 
+def delete_profile(account_id: str, mappings_dir: Path = DEFAULT_MAPPINGS_DIR) -> bool:
+    """Delete a saved account profile file, if present.
+
+    Args:
+        account_id: The account whose `{account_id}_config.json` to remove.
+        mappings_dir: Directory containing the profile files.
+
+    Returns:
+        True if a file was deleted, False if none existed.
+    """
+    path = _profile_path(account_id, mappings_dir)
+    if path.exists():
+        path.unlink()
+        logger.info("Deleted profile for account '%s'", account_id)
+        return True
+    return False
+
+
 def compute_schema_fingerprint(columns: list[str]) -> str:
     """Compute a stable fingerprint of a file's column set for profile reuse.
 

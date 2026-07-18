@@ -104,6 +104,7 @@ def load_transactions(
     end: str,
     account_ids: tuple[str, ...],
     categories: tuple[str, ...],
+    include_before: bool = False,
     db_path: str = str(DEFAULT_DB_PATH),
 ) -> pd.DataFrame:
     """Load the filtered, single-currency, non-internal transactions (cached).
@@ -114,10 +115,12 @@ def load_transactions(
         start, end: Inclusive ISO date bounds.
         account_ids: Accounts to include (empty tuple = all).
         categories: Categories to include (empty tuple = all).
+        include_before: If True, also include pre-tracking rows (part of the
+            cache key so the toggle busts the cache).
         db_path: Database path (part of the cache key).
 
     Returns:
-        A DataFrame filtered entirely in SQL.
+        A DataFrame filtered entirely in SQL (with `description_effective`/`notes`).
     """
     conn = db.get_connection(db_path)
     try:
@@ -129,9 +132,83 @@ def load_transactions(
             account_ids=account_ids or None,
             categories=categories or None,
             exclude_internal_transfers=True,
+            include_before=include_before,
         )
     finally:
         conn.close()
+
+
+@st.cache_data(show_spinner=False)
+def load_balance_series(
+    data_version: int,
+    currency: str,
+    start: str,
+    end: str,
+    account_ids: tuple[str, ...],
+    include_before: bool = False,
+    db_path: str = str(DEFAULT_DB_PATH),
+) -> tuple[pd.DataFrame, float]:
+    """Compute the running-balance time series and the current balance (cached).
+
+    Running balance INCLUDES internal transfers (they move real money within
+    the account) and NEVER mixes currencies. Pre-tracking amounts are already
+    baked into `opening_balance`; to keep totals correct while honoring the
+    "include before" toggle, the baseline is DECOMPOSED rather than double-counted:
+
+        - include_before = False: baseline = SUM(opening_balance); the cumulative
+          series runs over post-tracking rows only.
+        - include_before = True:  baseline = SUM(opening_balance) - SUM(pre-tracking
+          amounts); the cumulative series runs over ALL rows (pre + post). The
+          balance at/after the tracking date is identical to the False case;
+          only the pre-tracking build-up becomes visible.
+
+    Args:
+        data_version, currency, start, end, account_ids, include_before, db_path:
+            filter tuple (all part of the cache key).
+
+    Returns:
+        (series_df, current_balance) where series_df has columns [date, balance]
+        for dates within [start, end], and current_balance is the latest balance.
+    """
+    conn = db.get_connection(db_path)
+    try:
+        opening_sum = db.opening_balance_sum(conn, account_ids, currency)
+        ledger = db.fetch_account_ledger(conn, account_ids, currency, include_before=include_before)
+        if include_before:
+            pre = db.pre_tracking_amount_sum(conn, account_ids, currency)
+            baseline = opening_sum - pre
+        else:
+            baseline = opening_sum
+    finally:
+        conn.close()
+    series = balance_series(ledger, baseline, start, end)
+    current = float(baseline + ledger["amount"].sum()) if not ledger.empty else float(baseline)
+    return series, current
+
+
+def balance_series(ledger: pd.DataFrame, baseline: float, start: str, end: str) -> pd.DataFrame:
+    """Cumulative running balance per date, sliced to [start, end].
+
+    The cumulative sum runs over the FULL ledger from `baseline` (so the balance
+    at any date reflects all prior history), then only the in-period dates are
+    returned for plotting.
+
+    Args:
+        ledger: DataFrame [date, amount] ordered by date.
+        baseline: The balance just before the first ledger row.
+        start, end: Inclusive ISO date bounds of the display window.
+
+    Returns:
+        DataFrame [date, balance] for the period (empty if no data).
+    """
+    if ledger.empty:
+        return pd.DataFrame(columns=["date", "balance"])
+    daily = ledger.groupby(ledger["date"].dt.normalize())["amount"].sum().sort_index()
+    cumulative = baseline + daily.cumsum()
+    out = cumulative.reset_index()
+    out.columns = ["date", "balance"]
+    start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+    return out[(out["date"] >= start_ts) & (out["date"] <= end_ts)].reset_index(drop=True)
 
 
 def compute_kpis(df: pd.DataFrame) -> dict[str, float]:

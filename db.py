@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -25,6 +26,12 @@ from models import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_SCHEMA_PATH = Path("schema.sql")
+
+# Single source of truth for the effective (display) description. The ORIGINAL
+# `description` is immutable (it feeds transaction_hash); this expression is the
+# ONLY place COALESCE logic lives — reuse it everywhere the display label is read.
+# NULLIF treats an empty-string override as "no override".
+EFFECTIVE_DESCRIPTION_SQL = "COALESCE(NULLIF(transactions.description_override, ''), transactions.description)"
 
 
 def get_connection(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
@@ -106,7 +113,267 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions (category)")
+
+    # --- Opening balance per account ---------------------------------------
+    if not _column_exists(conn, "accounts", "opening_balance"):
+        logger.info("Migration: adding accounts.opening_balance")
+        conn.execute("ALTER TABLE accounts ADD COLUMN opening_balance REAL NOT NULL DEFAULT 0.0")
+    if not _column_exists(conn, "accounts", "opening_balance_date"):
+        logger.info("Migration: adding accounts.opening_balance_date")
+        conn.execute("ALTER TABLE accounts ADD COLUMN opening_balance_date TEXT")
+    if not _column_exists(conn, "accounts", "currency"):
+        logger.info("Migration: adding accounts.currency")
+        conn.execute("ALTER TABLE accounts ADD COLUMN currency TEXT")
+
+    # --- Editable description override + notes + pre-tracking flag ----------
+    if not _column_exists(conn, "transactions", "is_before_tracking"):
+        logger.info("Migration: adding transactions.is_before_tracking")
+        conn.execute(
+            "ALTER TABLE transactions ADD COLUMN is_before_tracking INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (is_before_tracking IN (0, 1))"
+        )
+    if not _column_exists(conn, "transactions", "description_override"):
+        logger.info("Migration: adding transactions.description_override")
+        conn.execute("ALTER TABLE transactions ADD COLUMN description_override TEXT")
+    if not _column_exists(conn, "transactions", "notes"):
+        logger.info("Migration: adding transactions.notes")
+        conn.execute("ALTER TABLE transactions ADD COLUMN notes TEXT")
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_transactions_before ON transactions (is_before_tracking)")
     conn.commit()
+
+    # --- Back-fill opening_balance_date / currency for existing accounts ----
+    # Default opening date = the day BEFORE each account's earliest transaction
+    # (so no existing row is retroactively excluded), opening_balance stays 0,
+    # currency = the account's most common transaction currency.
+    for row in conn.execute("SELECT account_id, opening_balance_date, currency FROM accounts").fetchall():
+        account_id = row["account_id"]
+        if row["opening_balance_date"] is None:
+            earliest = conn.execute(
+                "SELECT MIN(date) AS d FROM transactions WHERE account_id = ?", (account_id,)
+            ).fetchone()["d"]
+            if earliest is not None:
+                opening_date = (
+                    datetime.strptime(earliest, "%Y-%m-%d").date() - timedelta(days=1)
+                ).isoformat()
+                conn.execute(
+                    "UPDATE accounts SET opening_balance_date = ? WHERE account_id = ?",
+                    (opening_date, account_id),
+                )
+        if row["currency"] is None:
+            common = conn.execute(
+                "SELECT currency FROM transactions WHERE account_id = ? "
+                "GROUP BY currency ORDER BY COUNT(*) DESC LIMIT 1", (account_id,)
+            ).fetchone()
+            if common is not None:
+                conn.execute(
+                    "UPDATE accounts SET currency = ? WHERE account_id = ?",
+                    (common["currency"], account_id),
+                )
+    conn.commit()
+    for account_id in [r["account_id"] for r in conn.execute("SELECT account_id FROM accounts").fetchall()]:
+        recompute_tracking_flags(conn, account_id)
+
+
+def recompute_tracking_flags(conn: sqlite3.Connection, account_id: str) -> int:
+    """Recompute `is_before_tracking` for every row of one account.
+
+    A row is 'before tracking' when its date is on or before the account's
+    `opening_balance_date` (already baked into the opening balance). When the
+    account has no opening date, nothing is before tracking. Must be called
+    whenever the opening date changes or new rows are imported.
+
+    Returns:
+        The number of rows updated (flag flipped).
+    """
+    row = conn.execute(
+        "SELECT opening_balance_date FROM accounts WHERE account_id = ?", (account_id,)
+    ).fetchone()
+    opening_date = row["opening_balance_date"] if row is not None else None
+    if opening_date is None:
+        cursor = conn.execute(
+            "UPDATE transactions SET is_before_tracking = 0 "
+            "WHERE account_id = ? AND is_before_tracking != 0",
+            (account_id,),
+        )
+    else:
+        cursor = conn.execute(
+            "UPDATE transactions SET is_before_tracking = "
+            "CASE WHEN date <= ? THEN 1 ELSE 0 END WHERE account_id = ?",
+            (opening_date, account_id),
+        )
+    conn.commit()
+    return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+
+
+def get_account(conn: sqlite3.Connection, account_id: str) -> dict | None:
+    """Return the full accounts row (incl. opening balance/date/currency) as a dict."""
+    row = conn.execute("SELECT * FROM accounts WHERE account_id = ?", (account_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def set_opening_balance(
+    conn: sqlite3.Connection,
+    account_id: str,
+    opening_balance: float,
+    opening_balance_date: str | None,
+    currency: str | None = None,
+) -> None:
+    """Set an account's opening balance / tracking date (and optionally currency).
+
+    `opening_balance` is the balance as of the END of `opening_balance_date`.
+    Recomputes `is_before_tracking` for all of the account's rows, because the
+    date change shifts which rows are already baked into the opening balance.
+
+    Raises:
+        sqlite3.Error: on connection failure.
+    """
+    try:
+        if currency is not None:
+            conn.execute(
+                "UPDATE accounts SET opening_balance = ?, opening_balance_date = ?, currency = ? "
+                "WHERE account_id = ?",
+                (float(opening_balance), opening_balance_date, currency, account_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE accounts SET opening_balance = ?, opening_balance_date = ? WHERE account_id = ?",
+                (float(opening_balance), opening_balance_date, account_id),
+            )
+        conn.commit()
+        recompute_tracking_flags(conn, account_id)
+        logger.info(
+            "Set opening balance for '%s': %.2f as of %s", account_id, opening_balance, opening_balance_date
+        )
+    except sqlite3.Error:
+        conn.rollback()
+        logger.exception("Failed to set opening balance for '%s'", account_id)
+        raise
+
+
+def running_balance(conn: sqlite3.Connection, account_id: str) -> float | None:
+    """Current running balance = opening_balance + SUM(amount) for post-tracking rows.
+
+    Internal transfers are INCLUDED (they move real money within the account);
+    pre-tracking rows are excluded (already baked into opening_balance). For a
+    credit-card account this represents the outstanding amount owed, not cash.
+
+    Returns:
+        The running balance, or None if the account does not exist.
+    """
+    account = get_account(conn, account_id)
+    if account is None:
+        return None
+    total = conn.execute(
+        "SELECT COALESCE(SUM(amount), 0) AS s FROM transactions "
+        "WHERE account_id = ? AND is_before_tracking = 0",
+        (account_id,),
+    ).fetchone()["s"]
+    return float(account["opening_balance"]) + float(total)
+
+
+def fetch_account_ledger(
+    conn: sqlite3.Connection,
+    account_ids: tuple[str, ...],
+    currency: str,
+    include_before: bool = False,
+) -> pd.DataFrame:
+    """Fetch rows (internal transfers INCLUDED) for the running-balance series.
+
+    Args:
+        conn: An open SQLite connection.
+        account_ids: Accounts to include (must all be the given currency).
+        currency: The single currency (BRL/EUR never mixed).
+        include_before: If False (default), pre-tracking rows are excluded
+            (already baked into opening_balance). If True, all rows are returned
+            (the caller decomposes the baseline to avoid double-counting).
+
+    Returns:
+        DataFrame [date, amount] ordered by date.
+    """
+    if not account_ids:
+        return pd.DataFrame(columns=["date", "amount"])
+    placeholders = ",".join("?" * len(account_ids))
+    query = (
+        f"SELECT date, amount FROM transactions "
+        f"WHERE currency = ? AND account_id IN ({placeholders})"
+    )
+    if not include_before:
+        query += " AND is_before_tracking = 0"
+    query += " ORDER BY date"
+    return pd.read_sql_query(query, conn, params=[currency, *account_ids], parse_dates=["date"])
+
+
+def opening_balance_sum(conn: sqlite3.Connection, account_ids: tuple[str, ...], currency: str) -> float:
+    """Sum of opening balances for the given same-currency accounts."""
+    if not account_ids:
+        return 0.0
+    placeholders = ",".join("?" * len(account_ids))
+    row = conn.execute(
+        f"SELECT COALESCE(SUM(opening_balance), 0) AS s FROM accounts "
+        f"WHERE currency = ? AND account_id IN ({placeholders})",
+        [currency, *account_ids],
+    ).fetchone()
+    return float(row["s"])
+
+
+def pre_tracking_amount_sum(conn: sqlite3.Connection, account_ids: tuple[str, ...], currency: str) -> float:
+    """Sum of amounts of pre-tracking rows for the given same-currency accounts.
+
+    Used to DECOMPOSE the opening balance when the 'include before' toggle is on,
+    so the balance line extends back through the pre-tracking period without
+    double-counting (those amounts are already inside `opening_balance`).
+    """
+    if not account_ids:
+        return 0.0
+    placeholders = ",".join("?" * len(account_ids))
+    row = conn.execute(
+        f"SELECT COALESCE(SUM(amount), 0) AS s FROM transactions "
+        f"WHERE currency = ? AND is_before_tracking = 1 AND account_id IN ({placeholders})",
+        [currency, *account_ids],
+    ).fetchone()
+    return float(row["s"])
+
+
+def set_description_override(conn: sqlite3.Connection, transaction_hash: str, override: str | None) -> None:
+    """Set (or clear, when override is None/empty) a row's editable display label.
+
+    NEVER touches `description` or `transaction_hash` — those are immutable. An
+    empty/blank override is stored as NULL ("restaurar original").
+
+    Raises:
+        sqlite3.Error: on connection failure.
+    """
+    value = override.strip() if isinstance(override, str) and override.strip() else None
+    try:
+        conn.execute(
+            "UPDATE transactions SET description_override = ? WHERE transaction_hash = ?",
+            (value, transaction_hash),
+        )
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        logger.exception("Failed to set description_override for %s", transaction_hash)
+        raise
+
+
+def set_notes(conn: sqlite3.Connection, transaction_hash: str, notes: str | None) -> None:
+    """Set (or clear) a row's free-text note. LOCAL-ONLY — never sent to the LLM.
+
+    Raises:
+        sqlite3.Error: on connection failure.
+    """
+    value = notes.strip() if isinstance(notes, str) and notes.strip() else None
+    try:
+        conn.execute(
+            "UPDATE transactions SET notes = ? WHERE transaction_hash = ?",
+            (value, transaction_hash),
+        )
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        logger.exception("Failed to set notes for %s", transaction_hash)
+        raise
 
 
 def seed_categories(conn: sqlite3.Connection, categories_path: Path = DEFAULT_CATEGORIES_PATH) -> None:
@@ -143,15 +410,18 @@ def upsert_account(conn: sqlite3.Connection, profile: AccountProfile) -> None:
     Raises:
         sqlite3.Error: on constraint violation or connection failure.
     """
+    # currency comes from the profile's default currency; COALESCE on update
+    # keeps an already-set account currency if the profile omitted one.
     conn.execute(
         """
-        INSERT INTO accounts (account_id, account_type, bank_name)
-        VALUES (?, ?, ?)
+        INSERT INTO accounts (account_id, account_type, bank_name, currency)
+        VALUES (?, ?, ?, ?)
         ON CONFLICT (account_id) DO UPDATE SET
             account_type = excluded.account_type,
-            bank_name = excluded.bank_name
+            bank_name = excluded.bank_name,
+            currency = COALESCE(excluded.currency, accounts.currency)
         """,
-        (profile.account_id, profile.account_type.value, profile.bank_name),
+        (profile.account_id, profile.account_type.value, profile.bank_name, profile.default_currency.value),
     )
     conn.commit()
 
@@ -214,6 +484,10 @@ def insert_transactions(conn: sqlite3.Connection, df: pd.DataFrame) -> int:
     conn.commit()
     inserted = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else 0
     logger.info("Inserted %d new transactions (of %d rows submitted)", inserted, len(rows))
+    # Recompute the pre-tracking flag for every account that received rows, so
+    # newly-imported rows are correctly classified against the opening date.
+    for account_id in df["account_id"].unique().tolist():
+        recompute_tracking_flags(conn, str(account_id))
     return inserted
 
 
@@ -364,11 +638,13 @@ def account_stats(conn: sqlite3.Connection) -> list[dict]:
     cursor = conn.execute(
         """
         SELECT a.account_id, a.account_type, a.bank_name,
+               a.opening_balance, a.opening_balance_date, a.currency,
                COUNT(t.transaction_hash) AS tx_count,
                MIN(t.date) AS min_date, MAX(t.date) AS max_date
         FROM accounts a
         LEFT JOIN transactions t ON t.account_id = a.account_id
-        GROUP BY a.account_id, a.account_type, a.bank_name
+        GROUP BY a.account_id, a.account_type, a.bank_name,
+                 a.opening_balance, a.opening_balance_date, a.currency
         ORDER BY a.account_id
         """
     )
@@ -418,11 +694,15 @@ def fetch_transactions_filtered(
     account_ids: tuple[str, ...] | None = None,
     categories: tuple[str, ...] | None = None,
     exclude_internal_transfers: bool = True,
+    include_before: bool = False,
 ) -> pd.DataFrame:
     """Query transactions for the dashboard, pushing all filters into SQL.
 
     Currency is a SELECTOR, not a mixing filter: exactly one currency is
-    queried at a time (BRL and EUR are never summed or converted).
+    queried at a time (BRL and EUR are never summed or converted). The
+    effective display label (`description_effective`) is computed via the
+    single `EFFECTIVE_DESCRIPTION_SQL` expression; the immutable original
+    (`description`) and `description_override`/`notes` are also returned.
 
     Args:
         conn: An open SQLite connection.
@@ -431,14 +711,23 @@ def fetch_transactions_filtered(
         account_ids: Restrict to these accounts (None/empty = all).
         categories: Restrict to these categories (None/empty = all).
         exclude_internal_transfers: Always True for spend metrics.
+        include_before: If False (default), pre-tracking rows
+            (is_before_tracking = 1) are excluded.
 
     Returns:
         A DataFrame (parsed `date`) filtered on indexed columns.
     """
-    query = "SELECT * FROM transactions WHERE currency = ?"
+    query = (
+        f"SELECT transaction_hash, account_id, account_type, date, amount, currency, "
+        f"description, description_override, {EFFECTIVE_DESCRIPTION_SQL} AS description_effective, "
+        f"notes, category, is_internal_transfer, category_source, is_before_tracking "
+        f"FROM transactions WHERE currency = ?"
+    )
     params: list = [currency]
     if exclude_internal_transfers:
         query += " AND is_internal_transfer = 0"
+    if not include_before:
+        query += " AND is_before_tracking = 0"
     if start_iso is not None:
         query += " AND date >= ?"
         params.append(start_iso)
@@ -456,6 +745,8 @@ def fetch_transactions_filtered(
     df = pd.read_sql_query(query, conn, params=params, parse_dates=["date"])
     if "is_internal_transfer" in df.columns:
         df["is_internal_transfer"] = df["is_internal_transfer"].astype(bool)
+    if "is_before_tracking" in df.columns:
+        df["is_before_tracking"] = df["is_before_tracking"].astype(bool)
     return df
 
 
@@ -510,17 +801,21 @@ def fetch_categorizable(
 ) -> pd.DataFrame:
     """Fetch rows eligible for LLM categorization.
 
-    Eligible = not an internal transfer, not manually edited, and still
-    'Uncategorized'. Optionally scoped to one account and/or a specific set of
-    hashes (used to categorize ONLY newly-inserted rows).
+    Eligible = not an internal transfer, not manually edited, still
+    'Uncategorized', and not before tracking. Optionally scoped to one account
+    and/or a specific set of hashes (used to categorize ONLY newly-inserted rows).
+
+    The `description` returned is the EFFECTIVE label (a user-corrected override
+    is better LLM signal than the raw bank text). `notes` are LOCAL-ONLY and are
+    deliberately never selected here — they must never reach the LLM.
 
     Returns:
-        A DataFrame with columns [transaction_hash, description].
+        A DataFrame with columns [transaction_hash, description] (effective).
     """
     query = (
-        "SELECT transaction_hash, description FROM transactions "
-        "WHERE is_internal_transfer = 0 AND category_source != 'manual' "
-        "AND category = 'Uncategorized'"
+        f"SELECT transaction_hash, {EFFECTIVE_DESCRIPTION_SQL} AS description FROM transactions "
+        f"WHERE is_internal_transfer = 0 AND category_source != 'manual' "
+        f"AND category = 'Uncategorized' AND is_before_tracking = 0"
     )
     params: list = []
     if account_id is not None:

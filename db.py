@@ -114,6 +114,30 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions (category)")
 
+    # --- Asset valuation ledger (non-liquid assets, e.g. ETFs) --------------
+    # Kept STRICTLY separate from the transactional cash flow. Each asset owns
+    # its currency; BRL and EUR are never mixed. The composite PK on the history
+    # table makes valuation snapshots idempotent (one per asset per day).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS assets (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            name     TEXT NOT NULL UNIQUE,
+            currency TEXT NOT NULL CHECK (currency IN ('BRL', 'EUR'))
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS asset_valuation_history (
+            asset_id INTEGER NOT NULL REFERENCES assets (id),
+            date     TEXT NOT NULL,
+            balance  REAL NOT NULL,
+            PRIMARY KEY (asset_id, date)
+        )
+        """
+    )
+
     # --- Opening balance per account ---------------------------------------
     if not _column_exists(conn, "accounts", "opening_balance"):
         logger.info("Migration: adding accounts.opening_balance")
@@ -917,3 +941,113 @@ def delete_budget(conn: sqlite3.Connection, category: str, currency: str) -> Non
     """Remove a budget line for a (category, currency) pair."""
     conn.execute("DELETE FROM budgets WHERE category = ? AND currency = ?", (category, currency))
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Asset valuation ledger (non-liquid assets, e.g. ETFs)
+# ---------------------------------------------------------------------------
+# Manually-tracked valuations, kept STRICTLY separate from the transactional
+# cash flow: they never enter spend/income metrics or account balances. Each
+# asset carries its own currency; BRL and EUR are never mixed or converted.
+def register_asset(conn: sqlite3.Connection, name: str, currency: str) -> int:
+    """Register an asset (idempotent on name) and return its id.
+
+    Uses `INSERT OR IGNORE` so re-registering an existing name is a no-op and
+    keeps the original currency. The id is then looked up by the unique name.
+
+    Args:
+        conn: An open SQLite connection.
+        name: The asset's display name (unique).
+        currency: The asset's ISO 4217 currency ('BRL' or 'EUR').
+
+    Returns:
+        The asset's row id.
+
+    Raises:
+        sqlite3.Error: on constraint violation (e.g. invalid currency).
+    """
+    conn.execute("INSERT OR IGNORE INTO assets (name, currency) VALUES (?, ?)", (name, currency))
+    conn.commit()
+    row = conn.execute("SELECT id FROM assets WHERE name = ?", (name,)).fetchone()
+    return int(row["id"])
+
+
+def append_asset_valuation(
+    conn: sqlite3.Connection, asset_id: int, date_iso: str, balance: float
+) -> None:
+    """Append (or upsert) a valuation snapshot for one asset on one date.
+
+    Idempotent per (asset_id, date): re-logging the same date UPDATES the
+    balance rather than inserting a duplicate.
+
+    Args:
+        conn: An open SQLite connection.
+        asset_id: The owning asset's id.
+        date_iso: ISO 8601 snapshot date.
+        balance: The valuation in the asset's own currency.
+
+    Raises:
+        sqlite3.Error: on connection failure.
+    """
+    conn.execute(
+        """
+        INSERT INTO asset_valuation_history (asset_id, date, balance) VALUES (?, ?, ?)
+        ON CONFLICT (asset_id, date) DO UPDATE SET balance = excluded.balance
+        """,
+        (int(asset_id), date_iso, float(balance)),
+    )
+    conn.commit()
+
+
+def fetch_assets(conn: sqlite3.Connection, currency: str | None = None) -> list[dict]:
+    """List registered assets, optionally scoped to a single currency.
+
+    Args:
+        conn: An open SQLite connection.
+        currency: If set, restrict to assets of this single currency (BRL/EUR
+            never mixed). If None, return all assets.
+
+    Returns:
+        One dict per asset with keys id, name, currency, ordered by name.
+    """
+    if currency is not None:
+        cursor = conn.execute(
+            "SELECT id, name, currency FROM assets WHERE currency = ? ORDER BY name", (currency,)
+        )
+    else:
+        cursor = conn.execute("SELECT id, name, currency FROM assets ORDER BY name")
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def fetch_asset_valuations(conn: sqlite3.Connection, currency: str) -> pd.DataFrame:
+    """Fetch the valuation history for all assets of ONE currency.
+
+    Single-currency by construction (BRL and EUR are never mixed). Used to plot
+    the overlaid valuation-over-time chart.
+
+    Args:
+        conn: An open SQLite connection.
+        currency: The single ISO 4217 currency to render.
+
+    Returns:
+        DataFrame [asset, date, balance] ordered by date (parsed `date`).
+    """
+    query = (
+        "SELECT a.name AS asset, h.date AS date, h.balance AS balance "
+        "FROM asset_valuation_history h "
+        "JOIN assets a ON a.id = h.asset_id "
+        "WHERE a.currency = ? ORDER BY h.date"
+    )
+    return pd.read_sql_query(query, conn, params=[currency], parse_dates=["date"])
+
+
+def delete_asset(conn: sqlite3.Connection, asset_id: int) -> None:
+    """Delete an asset AND its full valuation history.
+
+    Raises:
+        sqlite3.Error: on connection failure.
+    """
+    conn.execute("DELETE FROM asset_valuation_history WHERE asset_id = ?", (int(asset_id),))
+    conn.execute("DELETE FROM assets WHERE id = ?", (int(asset_id),))
+    conn.commit()
+    logger.info("Deleted asset id=%s and its valuation history", asset_id)

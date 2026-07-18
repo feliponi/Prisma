@@ -572,6 +572,10 @@ def _render_balance_section(
         is_card = account["account_type"] == "credit_card"
         label = f"{account_id} — Saldo devedor" if is_card else f"{account_id} — Saldo"
         cols[i % 4].metric(label, _fmt_money(balance or 0.0, currency))
+        # Freshness indicator: date of the account's most recent transaction.
+        rng = db.account_date_range(conn, account_id)
+        if rng is not None:
+            cols[i % 4].caption(f"Última atualização: {rng[1]}")
         # Sanity warning: a bank account should not run negative.
         if not is_card and balance is not None and balance < 0:
             st.warning(
@@ -1136,6 +1140,90 @@ def _settings_page() -> None:
 
 
 # ---------------------------------------------------------------------------
+# PAGE: Patrimônio (manual asset valuation ledger)
+# ---------------------------------------------------------------------------
+def _render_patrimonio(conn: sqlite3.Connection) -> None:
+    """Manual asset valuation ledger, kept separate from the cash flow.
+
+    Assets (e.g. ETFs) are tracked per currency; BRL and EUR are never mixed or
+    converted. The page renders ONE currency at a time.
+    """
+    st.title("💼 Patrimônio")
+    st.caption(
+        "Acompanhe manualmente o valor de ativos não líquidos (ex.: ETFs), "
+        "separado do fluxo de caixa das contas."
+    )
+
+    # Currency SELECTOR (never mixes BRL/EUR).
+    currency_options = [c.value for c in Currency]
+    currency = st.radio(
+        "Moeda", currency_options, horizontal=True, key="pat_currency",
+        help="BRL e EUR nunca são somados ou convertidos.",
+    )
+
+    # ---- Register a new asset ----
+    st.header("Registrar ativo")
+    with st.form("pat_register_asset"):
+        new_name = st.text_input("Nome do ativo (ex.: IVVB11)", key="pat_new_name")
+        st.caption(f"O ativo será registrado na moeda selecionada: {currency}.")
+        if st.form_submit_button("Registrar ativo") and new_name.strip():
+            db.register_asset(conn, new_name.strip(), currency)
+            _bump_data_version()
+            st.success(f"Ativo '{new_name.strip()}' registrado ({currency}).")
+            st.rerun()
+
+    # ---- Log a valuation snapshot ----
+    st.header("Registrar avaliação")
+    assets = db.fetch_assets(conn, currency)
+    if not assets:
+        st.info(f"Nenhum ativo em {currency}. Registre um ativo acima para começar.")
+        return
+
+    asset_by_label = {a["name"]: a["id"] for a in assets}
+    with st.form("pat_log_valuation"):
+        v1, v2, v3 = st.columns(3)
+        asset_label = v1.selectbox("Ativo", list(asset_by_label.keys()), key="pat_val_asset")
+        val_date = v2.date_input("Data", value=date.today(), key="pat_val_date")
+        balance = v3.number_input("Valor", value=0.0, step=100.0, format="%.2f", key="pat_val_balance")
+        if st.form_submit_button("Registrar avaliação"):
+            db.append_asset_valuation(conn, asset_by_label[asset_label], val_date.isoformat(), float(balance))
+            _bump_data_version()
+            st.success(f"Avaliação de '{asset_label}' em {val_date.isoformat()} registrada.")
+            st.rerun()
+
+    # ---- Valuation history chart (all assets of this currency overlaid) ----
+    st.header("Histórico de avaliação")
+    version = st.session_state["data_version"]
+    history = analytics.load_asset_valuations(version, currency)
+    if history.empty:
+        st.info("Nenhuma avaliação registrada ainda para esta moeda.")
+    else:
+        chart = alt.Chart(history).mark_line(point=True).encode(
+            x=alt.X("date:T", title="Data"),
+            y=alt.Y("balance:Q", title=f"Valor ({currency})"),
+            color=alt.Color("asset:N", title="Ativo"),
+            tooltip=[alt.Tooltip("asset:N", title="Ativo"),
+                     alt.Tooltip("date:T", title="Data"),
+                     alt.Tooltip("balance:Q", title="Valor", format=".2f")],
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+    # ---- Remove an asset ----
+    st.subheader("Excluir ativo")
+    del_label = st.selectbox("Ativo a excluir", list(asset_by_label.keys()), key="pat_del_asset")
+    st.warning(f"Excluir '{del_label}' remove TAMBÉM todo o seu histórico de avaliação.")
+    if st.button("Excluir ativo permanentemente", key="pat_del_btn"):
+        db.delete_asset(conn, asset_by_label[del_label])
+        _bump_data_version()
+        st.success(f"Ativo '{del_label}' excluído.")
+        st.rerun()
+
+
+def _patrimonio_page() -> None:
+    _render_patrimonio(_get_db_connection())
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -1152,6 +1240,7 @@ def main() -> None:
     navigation = st.navigation([
         st.Page(_dashboard_page, title="Dashboard", icon="📊", default=True),
         st.Page(_update_page, title="Atualizar transações", icon="⬆️"),
+        st.Page(_patrimonio_page, title="Patrimônio", icon="💼"),
         st.Page(_settings_page, title="Configurações", icon="⚙️"),
     ])
     navigation.run()

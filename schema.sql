@@ -43,6 +43,25 @@ CREATE TABLE IF NOT EXISTS transactions (
     notes                    TEXT
 );
 
+-- Manually-tracked non-liquid assets (e.g. ETFs, investments), kept STRICTLY
+-- separate from the transactional cash flow. Each asset carries its own
+-- currency; BRL and EUR are never mixed or converted.
+CREATE TABLE IF NOT EXISTS assets (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    name     TEXT NOT NULL UNIQUE,
+    currency TEXT NOT NULL CHECK (currency IN ('BRL', 'EUR'))
+);
+
+-- Historical valuation snapshots per asset. The composite PK enforces one
+-- snapshot per asset per day, so re-logging the same date UPSERTS the balance
+-- instead of duplicating it.
+CREATE TABLE IF NOT EXISTS asset_valuation_history (
+    asset_id INTEGER NOT NULL REFERENCES assets (id),
+    date     TEXT NOT NULL,          -- ISO 8601 date, e.g. "2024-03-01"
+    balance  REAL NOT NULL,          -- valuation in the asset's own currency
+    PRIMARY KEY (asset_id, date)
+);
+
 -- Planned budget per (category, currency). BRL and EUR are never mixed.
 CREATE TABLE IF NOT EXISTS budgets (
     category        TEXT NOT NULL REFERENCES categories (name),

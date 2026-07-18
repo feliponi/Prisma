@@ -186,6 +186,33 @@ def load_balance_series(
     return series, current
 
 
+@st.cache_data(show_spinner=False)
+def load_asset_valuations(
+    data_version: int,
+    currency: str,
+    db_path: str = str(DEFAULT_DB_PATH),
+) -> pd.DataFrame:
+    """Load the valuation history of all assets of ONE currency (cached).
+
+    Assets (non-liquid, e.g. ETFs) are tracked independently of the cash flow;
+    BRL and EUR are never mixed. The cache is keyed on `data_version` so writes
+    bust it, mirroring `load_transactions`.
+
+    Args:
+        data_version: Monotonic counter; changing it busts the cache after writes.
+        currency: The single currency to render.
+        db_path: Database path (part of the cache key).
+
+    Returns:
+        DataFrame [asset, date, balance] ordered by date.
+    """
+    conn = db.get_connection(db_path)
+    try:
+        return db.fetch_asset_valuations(conn, currency)
+    finally:
+        conn.close()
+
+
 def balance_series(ledger: pd.DataFrame, baseline: float, start: str, end: str) -> pd.DataFrame:
     """Cumulative running balance per date, sliced to [start, end].
 

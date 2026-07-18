@@ -7,7 +7,12 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS accounts (
     account_id   TEXT PRIMARY KEY,
     account_type TEXT NOT NULL CHECK (account_type IN ('bank_account', 'credit_card')),
-    bank_name    TEXT NOT NULL
+    bank_name    TEXT NOT NULL,
+    -- Balance as of the END of opening_balance_date (i.e. it already includes
+    -- every transaction up to and including that date).
+    opening_balance      REAL NOT NULL DEFAULT 0.0,
+    opening_balance_date TEXT,  -- ISO date: the account's tracking start date
+    currency             TEXT CHECK (currency IN ('BRL', 'EUR'))  -- the account's own currency
 );
 
 CREATE TABLE IF NOT EXISTS categories (
@@ -26,7 +31,16 @@ CREATE TABLE IF NOT EXISTS transactions (
     is_internal_transfer     INTEGER NOT NULL DEFAULT 0 CHECK (is_internal_transfer IN (0, 1)),
     -- Provenance of the category: 'llm' (auto), 'manual' (user edit, never
     -- overwritten by a later LLM run), or 'rule' (forced, e.g. internal transfer).
-    category_source          TEXT NOT NULL DEFAULT 'llm' CHECK (category_source IN ('llm', 'manual', 'rule'))
+    category_source          TEXT NOT NULL DEFAULT 'llm' CHECK (category_source IN ('llm', 'manual', 'rule')),
+    -- 1 when date <= the account's opening_balance_date: already baked into the
+    -- opening balance, so EXCLUDED from running balance and spend metrics by
+    -- default (kept, never discarded). Recomputed when the opening date changes.
+    is_before_tracking       INTEGER NOT NULL DEFAULT 0 CHECK (is_before_tracking IN (0, 1)),
+    -- User-editable display label. The ORIGINAL `description` is IMMUTABLE (it
+    -- feeds transaction_hash); effective display = COALESCE(description_override, description).
+    description_override     TEXT,
+    -- Free-text personal note. LOCAL-ONLY: never sent to the LLM.
+    notes                    TEXT
 );
 
 -- Planned budget per (category, currency). BRL and EUR are never mixed.

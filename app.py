@@ -20,7 +20,7 @@ import io
 import json
 import logging
 import sqlite3
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import altair as alt
 import pandas as pd
@@ -420,8 +420,31 @@ def render_canonical_preview_and_import(profile: AccountProfile) -> pd.DataFrame
     st.session_state["sanitized_df"] = sanitized_df
     st.dataframe(sanitized_df, use_container_width=True)
     st.caption(f"{len(sanitized_df)} transações válidas. Conta ativa: {profile.account_id}.")
+
+    # ---- Opening balance (tracking start) ----
+    st.subheader("Saldo inicial")
+    earliest = sanitized_df["date"].min().date()
+    default_open_date = earliest - timedelta(days=1)
+    st.caption(
+        "O saldo inicial é o saldo ao FINAL da data de início do controle "
+        f"(sugestão: {default_open_date.isoformat()}, um dia antes do primeiro lançamento "
+        f"deste arquivo — {earliest.isoformat()}). Lançamentos até essa data são "
+        "guardados, mas ficam de fora do saldo corrente (já embutidos no saldo inicial)."
+    )
+    oc1, oc2 = st.columns(2)
+    opening_balance = oc1.number_input(
+        "Saldo inicial", value=0.0, step=100.0, format="%.2f", key="onb_opening_balance"
+    )
+    opening_balance_date = oc2.date_input(
+        "Data de início do controle", value=default_open_date, key="onb_opening_date"
+    )
+
     if st.button("Importar transações no banco de dados local", key="import_btn"):
         conn = _get_db_connection()
+        db.set_opening_balance(
+            conn, profile.account_id, float(opening_balance),
+            opening_balance_date.isoformat(), currency=profile.default_currency.value,
+        )
         inserted = db.insert_transactions(conn, sanitized_df)
         st.session_state["last_import_hashes"] = tuple(sanitized_df["transaction_hash"])
         st.session_state["last_import_account"] = profile.account_id
@@ -520,6 +543,61 @@ def _delta_str(current: float, previous: float) -> str | None:
     return f"{(current - previous) / previous * 100:+.1f}%"
 
 
+def _render_balance_section(
+    conn: sqlite3.Connection, currency: str, accounts_key: tuple[str, ...],
+    bounds, include_before: bool, version: int,
+) -> None:
+    """Render running-balance metrics per account + a balance-over-time chart.
+
+    Balances INCLUDE internal transfers and NEVER mix currencies. Only accounts
+    whose own currency matches the dashboard currency are shown. Credit-card
+    accounts are labelled "Saldo devedor" (outstanding owed): a negative amount
+    means money owed (spend is negative), a positive amount means credit.
+    """
+    # Restrict to accounts of THIS currency (never mix BRL/EUR).
+    accounts = accounts_key or tuple(db.list_all_accounts(conn))
+    currency_accounts = tuple(
+        a for a in accounts
+        if (db.get_account(conn, a) or {}).get("currency") == currency
+    )
+    if not currency_accounts:
+        return
+
+    st.subheader(f"Saldo por conta ({currency})")
+    cols = st.columns(min(len(currency_accounts), 4))
+    for i, account_id in enumerate(currency_accounts):
+        account = db.get_account(conn, account_id)
+        balance = db.running_balance(conn, account_id)
+        is_card = account["account_type"] == "credit_card"
+        label = f"{account_id} — Saldo devedor" if is_card else f"{account_id} — Saldo"
+        cols[i % 4].metric(label, _fmt_money(balance or 0.0, currency))
+        # Sanity warning: a bank account should not run negative.
+        if not is_card and balance is not None and balance < 0:
+            st.warning(
+                f"⚠️ O saldo da conta '{account_id}' está negativo "
+                f"({_fmt_money(balance, currency)}). Verifique o saldo inicial ou "
+                "um extrato faltante."
+            )
+    if any(a["account_type"] == "credit_card" for a in
+           (db.get_account(conn, x) for x in currency_accounts)):
+        st.caption("Cartões de crédito: 'Saldo devedor' — negativo indica valor devido; "
+                   "positivo indica crédito a favor.")
+
+    # Balance-over-time line chart (5th chart; internal transfers included).
+    series, current = analytics.load_balance_series(
+        version, currency, bounds.start, bounds.end, currency_accounts, include_before,
+    )
+    if not series.empty:
+        st.subheader("Saldo ao longo do tempo")
+        chart = alt.Chart(series).mark_line(point=True, color="#00695c").encode(
+            x=alt.X("date:T", title="Data"),
+            y=alt.Y("balance:Q", title=f"Saldo ({currency})"),
+            tooltip=[alt.Tooltip("date:T", title="Data"),
+                     alt.Tooltip("balance:Q", title="Saldo", format=".2f")],
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+
 def _render_dashboard(conn: sqlite3.Connection) -> None:
     """Render the financial dashboard for a single selected currency."""
     currencies = db.list_currencies(conn)
@@ -557,16 +635,26 @@ def _render_dashboard(conn: sqlite3.Connection) -> None:
         )
         category_options = db.list_all_categories(conn)
         selected_categories = c4.multiselect("Categorias", category_options, default=[], key="dash_categories")
+        include_before = st.toggle(
+            "Incluir lançamentos anteriores ao início do controle",
+            value=False, key="dash_include_before",
+            help="Por padrão, lançamentos anteriores à data de início do controle "
+                 "ficam ocultos (já embutidos no saldo inicial).",
+        )
 
     version = st.session_state["data_version"]
+    accounts_key = tuple(sorted(selected_accounts))
     df = analytics.load_transactions(
         version, currency, bounds.start, bounds.end,
-        tuple(sorted(selected_accounts)), tuple(sorted(selected_categories)),
+        accounts_key, tuple(sorted(selected_categories)), include_before,
     )
     prev_df = analytics.load_transactions(
         version, currency, bounds.prev_start, bounds.prev_end,
-        tuple(sorted(selected_accounts)), tuple(sorted(selected_categories)),
+        accounts_key, tuple(sorted(selected_categories)), include_before,
     )
+
+    # ---- Running balance per account (currency never mixed) ----
+    _render_balance_section(conn, currency, accounts_key, bounds, include_before, version)
 
     if df.empty:
         st.info("Nenhuma transação no período/filtros selecionados.")
@@ -650,29 +738,57 @@ def _render_dashboard(conn: sqlite3.Connection) -> None:
 
 
 def _render_transaction_table(conn: sqlite3.Connection, df: pd.DataFrame, currency: str) -> None:
-    """Filtered, searchable, inline-editable transaction table with CSV export."""
+    """Filtered, searchable, inline-editable transaction table with CSV export.
+
+    Uses the EFFECTIVE description (COALESCE(override, original)) for display,
+    search and export. The original bank text is immutable and shown in a
+    disabled 'Original (banco)' column; editing the 'Descrição' cell writes
+    `description_override` only (setting it back to the original text clears the
+    override — "restaurar original"). `notes` are editable and searchable, and a
+    📝 flag marks rows that have notes. Notes are never sent to the LLM.
+    """
     st.subheader("Transações")
     s1, s2 = st.columns([2, 1])
-    search = s1.text_input("Buscar na descrição", key="tbl_search").strip()
+    search = s1.text_input("Buscar (descrição ou notas)", key="tbl_search").strip()
     focus_options = ["(todas)"] + sorted(df["category"].unique().tolist())
     focus = s2.selectbox("Focar em categoria", focus_options, key="tbl_focus")
 
-    view = df.copy()
+    work = df.copy()
+    work["notes"] = work["notes"].fillna("")
     if search:
-        view = view[view["description"].str.contains(search, case=False, na=False)]
+        mask = (
+            work["description_effective"].str.contains(search, case=False, na=False)
+            | work["notes"].str.contains(search, case=False, na=False)
+        )
+        work = work[mask]
     if focus != "(todas)":
-        view = view[view["category"] == focus]
+        work = work[work["category"] == focus]
 
-    view = view[["transaction_hash", "date", "description", "category", "amount", "account_id", "category_source"]]
-    view = view.assign(date=view["date"].dt.strftime("%Y-%m-%d")).set_index("transaction_hash")
+    view = pd.DataFrame({
+        "📝": work["notes"].map(lambda n: "📝" if n else ""),
+        "date": work["date"].dt.strftime("%Y-%m-%d"),
+        "Descrição": work["description_effective"],
+        "Original (banco)": work["description"],
+        "category": work["category"],
+        "Notas": work["notes"],
+        "amount": work["amount"],
+        "account_id": work["account_id"],
+        "category_source": work["category_source"],
+    })
+    view.index = work["transaction_hash"]
 
     all_categories = db.list_all_categories(conn)
     edited = st.data_editor(
         view,
         column_config={
-            "category": st.column_config.SelectboxColumn("Categoria", options=all_categories, required=True),
+            "📝": st.column_config.TextColumn("📝", disabled=True, width="small"),
             "date": st.column_config.TextColumn("Data", disabled=True),
-            "description": st.column_config.TextColumn("Descrição", disabled=True),
+            "Descrição": st.column_config.TextColumn(
+                "Descrição", help="Edite para sobrescrever o texto do banco; "
+                "volte ao texto original para restaurar."),
+            "Original (banco)": st.column_config.TextColumn("Original (banco)", disabled=True),
+            "category": st.column_config.SelectboxColumn("Categoria", options=all_categories, required=True),
+            "Notas": st.column_config.TextColumn("Notas (local)", help="Nunca enviado à IA."),
             "amount": st.column_config.NumberColumn("Valor", disabled=True, format="%.2f"),
             "account_id": st.column_config.TextColumn("Conta", disabled=True),
             "category_source": st.column_config.TextColumn("Origem", disabled=True),
@@ -680,22 +796,46 @@ def _render_transaction_table(conn: sqlite3.Connection, df: pd.DataFrame, curren
         use_container_width=True, hide_index=True, key="tbl_editor",
     )
 
-    if st.button("Salvar categorias editadas", key="tbl_save"):
+    if st.button("Salvar alterações", key="tbl_save"):
         changed = 0
-        for tx_hash, new_cat in edited["category"].items():
+        for tx_hash in edited.index:
+            new_desc = str(edited.loc[tx_hash, "Descrição"] or "").strip()
+            original = str(view.loc[tx_hash, "Original (banco)"] or "").strip()
+            cur_effective = str(view.loc[tx_hash, "Descrição"] or "").strip()
+            if new_desc != cur_effective:
+                # Setting it back to the bank text clears the override (restaurar).
+                db.set_description_override(conn, tx_hash, None if new_desc == original else new_desc)
+                changed += 1
+            new_notes = str(edited.loc[tx_hash, "Notas"] or "").strip()
+            if new_notes != str(view.loc[tx_hash, "Notas"] or "").strip():
+                db.set_notes(conn, tx_hash, new_notes or None)
+                changed += 1
+            new_cat = edited.loc[tx_hash, "category"]
             if new_cat != view.loc[tx_hash, "category"]:
                 db.set_manual_category(conn, tx_hash, new_cat)  # durable: category_source='manual'
                 changed += 1
         if changed:
             _bump_data_version()
-            st.success(f"{changed} categoria(s) atualizada(s) manualmente.")
+            st.success(f"{changed} alteração(ões) salva(s).")
             st.rerun()
         else:
             st.info("Nenhuma alteração para salvar.")
 
-    csv_bytes = df.assign(date=df["date"].dt.strftime("%Y-%m-%d")).to_csv(index=False).encode("utf-8")
+    # Export: effective label + BOTH original and override + notes (raw text never lost).
+    export = pd.DataFrame({
+        "date": df["date"].dt.strftime("%Y-%m-%d"),
+        "description_effective": df["description_effective"],
+        "description_original": df["description"],
+        "description_override": df["description_override"],
+        "notes": df["notes"],
+        "category": df["category"],
+        "amount": df["amount"],
+        "currency": df["currency"],
+        "account_id": df["account_id"],
+        "is_internal_transfer": df["is_internal_transfer"],
+    })
     st.download_button(
-        "Exportar visão filtrada (CSV)", data=csv_bytes,
+        "Exportar visão filtrada (CSV)", data=export.to_csv(index=False).encode("utf-8"),
         file_name=f"transacoes_{currency}.csv", mime="text/csv", key="tbl_export",
     )
 
@@ -863,7 +1003,9 @@ def _render_settings(conn: sqlite3.Connection) -> None:
     if stats:
         st.dataframe(pd.DataFrame(stats).rename(columns={
             "account_id": "Conta", "account_type": "Tipo", "bank_name": "Banco",
-            "tx_count": "Transações", "min_date": "Início", "max_date": "Fim",
+            "currency": "Moeda", "opening_balance": "Saldo inicial",
+            "opening_balance_date": "Início do controle",
+            "tx_count": "Transações", "min_date": "1º lançamento", "max_date": "Último lançamento",
         }), use_container_width=True)
 
     if st.button("➕ Nova conta (importar novo banco)", key="cfg_new_account"):
@@ -871,6 +1013,38 @@ def _render_settings(conn: sqlite3.Connection) -> None:
         st.session_state["uploaded_sig"] = None
         st.session_state["onboarding_active"] = True
         st.rerun()
+
+    # ---- Edit opening balance / tracking date ----
+    st.subheader("Saldo inicial e início do controle")
+    edit_accounts = db.list_all_accounts(conn)
+    if edit_accounts:
+        edit_target = st.selectbox("Conta", edit_accounts, key="cfg_bal_account")
+        account = db.get_account(conn, edit_target) or {}
+        st.caption(
+            "O saldo inicial é o saldo ao FINAL da data de início do controle "
+            "(já inclui todos os lançamentos até essa data). Lançamentos até essa data "
+            "ficam de fora do saldo corrente e das métricas por padrão."
+        )
+        e1, e2 = st.columns(2)
+        new_open_balance = e1.number_input(
+            "Saldo inicial", value=float(account.get("opening_balance") or 0.0),
+            step=100.0, format="%.2f", key="cfg_bal_value",
+        )
+        current_date = account.get("opening_balance_date")
+        default_d = datetime.strptime(current_date, "%Y-%m-%d").date() if current_date else date.today()
+        new_open_date = e2.date_input(
+            "Data de início do controle", value=default_d, key="cfg_bal_date",
+        )
+        st.caption(f"Moeda da conta: {account.get('currency') or '—'}.")
+        st.warning(
+            "Alterar a data recalcula quais lançamentos são anteriores ao início do "
+            "controle e desloca todos os saldos desta conta."
+        )
+        if st.button("Salvar saldo inicial", key="cfg_bal_save"):
+            db.set_opening_balance(conn, edit_target, float(new_open_balance), new_open_date.isoformat())
+            _bump_data_version()
+            st.success(f"Saldo inicial da conta '{edit_target}' atualizado.")
+            st.rerun()
 
     # ---- Delete account ----
     st.subheader("Excluir conta")

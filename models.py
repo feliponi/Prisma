@@ -81,9 +81,9 @@ class AccountProfile:
     # --- Import-provenance fields (additive, backward compatible) ---------
     # Added by the interactive-import feature so a re-uploaded file of the
     # same shape can reuse this profile in one click. All optional with
-    # defaults so profiles saved before this feature still load unchanged.
-    # NOTE: Phase 2 extends to_dict/from_dict to round-trip these keys; in
-    # Phase 1 they exist as the schema contract but are not yet (de)serialized.
+    # defaults so profiles saved before this feature still load unchanged;
+    # to_dict/from_dict below round-trip them (from_dict tolerates their
+    # absence for backward compatibility with pre-feature JSON).
     source_type: str | None = None  # "csv" | "xls" | "pdf"
     sheet_name: str | None = None  # Excel sheet name, else None
     header_row: int = 0  # header row index (Excel/PDF); 0 for plain CSV
@@ -114,6 +114,12 @@ class AccountProfile:
             "default_currency": self.default_currency.value,
             "skip_rows_regex": self.skip_rows_regex,
             "internal_transfer_regex": self.internal_transfer_regex,
+            # Import-provenance fields (additive; feed the one-click reuse path).
+            "source_type": self.source_type,
+            "sheet_name": self.sheet_name,
+            "header_row": self.header_row,
+            "pdf_strategy": self.pdf_strategy,
+            "schema_fingerprint": self.schema_fingerprint,
         }
 
     @classmethod
@@ -151,6 +157,12 @@ class AccountProfile:
             default_currency=Currency(data["default_currency"]),
             skip_rows_regex=data["skip_rows_regex"],
             internal_transfer_regex=data["internal_transfer_regex"],
+            # Provenance fields default when absent (pre-feature profiles).
+            source_type=data.get("source_type"),
+            sheet_name=data.get("sheet_name"),
+            header_row=int(data.get("header_row", 0)),
+            pdf_strategy=data.get("pdf_strategy"),
+            schema_fingerprint=data.get("schema_fingerprint"),
         )
 
 

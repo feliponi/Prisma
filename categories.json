@@ -15,12 +15,12 @@
     "Carro",
     "Viagem",
     "Investimentos",
-    "Transferência interna",
     "Impostos",
     "Taxas e tarifas",
     "Outros"
   ],
   "system_categories": [
+    "Transferência interna",    
     "Uncategorized"
   ]
 }

@@ -311,7 +311,7 @@ def render_mapping_ui(raw: RawTable, suggested: dict[str, str]) -> MappingResult
         )
         internal_transfer_regex = st.text_input(
             "Regex de transferência interna",
-            value="(?i)PAG.*FATURA|PGTO.*FATURA|PGTO CARTAO|BILL PAYMENT",
+            value="(?i)PAG.*FATURA|PGTO.*FATURA|PGTO CARTAO|BILL PAYMENT|INSTANT SAVINGS|MAIN ACCOUNT|LUIZ & DEBORA|INCOME SORTER|EQUITIES SETTLEMENT ACCOUNT|INTERNAL TRANSFER|TRANSFERENCIA INTERNA|TRANSFERENCIA ENTRE CONTAS|TRANSFERENCIA ENTRE CONTAS PRISMA|ABRECHNUNG AMAZON VISA",
             key="map_internal",
         )
 

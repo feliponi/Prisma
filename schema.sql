@@ -29,6 +29,10 @@ CREATE TABLE IF NOT EXISTS transactions (
     description            TEXT NOT NULL,
     category                TEXT NOT NULL DEFAULT 'Uncategorized' REFERENCES categories (name),
     is_internal_transfer     INTEGER NOT NULL DEFAULT 0 CHECK (is_internal_transfer IN (0, 1)),
+    -- Provenance of the internal-transfer flag: 'regex' (auto-detected by the
+    -- account's internal_transfer_regex) or 'manual' (user override). A 'manual'
+    -- flag is NEVER overwritten by a later import or regex re-scan.
+    internal_transfer_source TEXT NOT NULL DEFAULT 'regex' CHECK (internal_transfer_source IN ('regex', 'manual')),
     -- Provenance of the category: 'llm' (auto), 'manual' (user edit, never
     -- overwritten by a later LLM run), or 'rule' (forced, e.g. internal transfer).
     category_source          TEXT NOT NULL DEFAULT 'llm' CHECK (category_source IN ('llm', 'manual', 'rule')),

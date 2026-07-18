@@ -317,6 +317,39 @@ def opening_balance_sum(conn: sqlite3.Connection, account_ids: tuple[str, ...], 
     return float(row["s"])
 
 
+def balance_as_of(
+    conn: sqlite3.Connection, account_ids: tuple[str, ...], currency: str, end_iso: str
+) -> float:
+    """Running balance for same-currency accounts as of `end_iso`.
+
+    = opening_balance_sum + SUM(amount) over non-pre-tracking rows (internal
+    transfers INCLUDED) with date <= end_iso. Category-agnostic and never mixes
+    currencies. Invariant to the 'include before' toggle (pre-tracking amounts
+    are already inside the opening balance). Mirrors `running_balance` but
+    bounded to a date and aggregated over several accounts, so it stays
+    consistent with the per-account "Saldo por conta" totals.
+
+    Args:
+        conn: An open SQLite connection.
+        account_ids: Same-currency accounts to include (empty -> 0.0).
+        currency: The single ISO 4217 currency.
+        end_iso: Inclusive ISO date upper bound.
+
+    Returns:
+        The running balance as of `end_iso`.
+    """
+    if not account_ids:
+        return 0.0
+    placeholders = ",".join("?" * len(account_ids))
+    row = conn.execute(
+        f"SELECT COALESCE(SUM(amount), 0) AS s FROM transactions "
+        f"WHERE currency = ? AND is_before_tracking = 0 AND date <= ? "
+        f"AND account_id IN ({placeholders})",
+        [currency, end_iso, *account_ids],
+    ).fetchone()
+    return opening_balance_sum(conn, account_ids, currency) + float(row["s"])
+
+
 def pre_tracking_amount_sum(conn: sqlite3.Connection, account_ids: tuple[str, ...], currency: str) -> float:
     """Sum of amounts of pre-tracking rows for the given same-currency accounts.
 

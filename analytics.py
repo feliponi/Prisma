@@ -245,9 +245,11 @@ def expense_by_category(df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
         top = totals.iloc[:top_n]
         others = float(totals.iloc[top_n:].sum())
         totals = pd.concat([top, pd.Series({"Outros": others})])
-    return totals.reset_index().rename(columns={"index": "category"}).sort_values(
-        "spend", ascending=False
-    ).reset_index(drop=True)
+    # pd.concat above drops the Series/index names; set them explicitly so
+    # reset_index() yields deterministic ["category", "spend"] columns.
+    totals.index.name = "category"
+    totals.name = "spend"
+    return totals.reset_index().sort_values("spend", ascending=False).reset_index(drop=True)
 
 
 def expense_by_account(df: pd.DataFrame) -> pd.DataFrame:

@@ -1,28 +1,37 @@
 """Streamlit UI for the Personal Finance MVP.
 
-Pipeline: Select/Create Account -> Upload -> Map -> Preview -> Categorize
-(spinner) -> Insights. UI is strictly separated from transform/AI logic:
-this module orchestrates calls into csv_mapper.py, ai_services.py, and
-db.py, and owns `st.session_state` only.
+Navigation:
+    - 0 accounts            -> ONBOARDING (upload-first import incl. account creation).
+    - >= 1 account          -> 3-page app via st.navigation:
+        * Dashboard             (default landing; financial overview)
+        * Atualizar transações  (incremental import into an existing account)
+        * Configurações         (accounts, profiles, taxonomy, budgets)
 
-All user-facing strings (labels, buttons, messages) are pt_BR;
-identifiers/comments/logs stay English.
+Rules: UI strings pt_BR; code/identifiers English. BRL/EUR never mixed.
+Internal transfers excluded from all metrics. Manual category edits are durable.
+UI is separated from transform (csv_mapper/file_ingest), analytics (analytics),
+persistence (db) and AI (ai_services) logic.
 """
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
 import sqlite3
+from datetime import date
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
 import ai_services
+import analytics
 import csv_mapper
 import db
 import file_ingest
+import import_service
 import mapping_ui
 from models import (
     AccountProfile,
@@ -38,14 +47,29 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 NEW_ACCOUNT_LABEL = "+ Nova conta"
+BRIDGE_DELIMITER = ";"
+_EXTENSION_TO_SOURCE = {"csv": "csv", "xls": "xls", "xlsx": "xls", "pdf": "pdf"}
+_ACCOUNT_TYPE_LABELS = {"bank_account": "Conta bancária", "credit_card": "Cartão de crédito"}
+_PDF_STRATEGY_LABELS = {"stream": "Texto alinhado (stream)", "lattice": "Tabela com linhas (lattice)"}
+
+_PIPELINE_STATE_KEYS = [
+    "raw_table", "bank_profile", "active_account_id", "sanitized_df",
+    "mapping_result", "csv_dialect", "csv_guess", "selected_sheet", "source_type",
+    "pdf_extraction", "pdf_strategy", "last_import_hashes", "last_import_account",
+]
+_PIPELINE_WIDGET_PREFIXES = ("map_", "sortable", "csv_", "xls_", "pdf_", "bind_", "reuse_")
 
 
+# ---------------------------------------------------------------------------
+# Connection / session
+# ---------------------------------------------------------------------------
 @st.cache_resource
 def _get_db_connection() -> sqlite3.Connection:
-    """Open (and lazily initialize) the singleton SQLite connection for this app."""
+    """Open, initialize and MIGRATE the singleton SQLite connection."""
     conn = db.get_connection(DEFAULT_DB_PATH)
     db.init_schema(conn)
     db.seed_categories(conn, DEFAULT_CATEGORIES_PATH)
+    db.apply_migrations(conn)
     return conn
 
 
@@ -56,615 +80,893 @@ def _load_categories_taxonomy() -> list[str]:
 
 
 def init_session_state() -> None:
-    """Populate `st.session_state` with the SessionStateSchema defaults if unset.
-
-    Must be called once at the top of every script rerun before any other
-    render function reads session_state, so widget interactions never reset
-    pipeline state (uploaded file, mapping, sanitized/categorized data,
-    category cache, budgets).
-    """
+    """Populate `st.session_state` defaults once per rerun."""
     defaults = {
         "active_account_id": None,
         "bank_profile": None,
         "uploaded_bytes": None,
+        "uploaded_sig": None,
         "sanitized_df": None,
-        "categorized_df": None,
         "category_cache": {},
-        "budget_by_category": {},
-        "pending_new_account": None,
-        # --- Interactive-import pipeline keys (Phase 2 wiring) ------------
-        "raw_table": None,  # file_ingest.RawTable of the current upload
-        "suggested_mapping": None,  # mapping_ui.suggest_mapping output
-        "mapping_result": None,  # mapping_ui.MappingResult from the visual step
-        "header_row": 0,  # user-chosen header row index (Excel/PDF)
-        "selected_sheet": None,  # user-chosen Excel sheet name
-        "source_type": None,  # "csv" | "xls" | "pdf" of the current upload
-        "csv_dialect": None,  # file_ingest.CsvDialect after sniff + overrides
-        "pdf_extraction": None,  # file_ingest.PdfExtractionResult, if PDF
+        "raw_table": None,
+        "mapping_result": None,
+        "header_row": 0,
+        "selected_sheet": None,
+        "source_type": None,
+        "csv_dialect": None,
+        "csv_guess": None,
+        "pdf_extraction": None,
+        "pdf_strategy": None,
+        "onboarding_active": False,
+        "data_version": 0,
+        "last_import_hashes": None,
+        "last_import_account": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
 
 
-def render_account_selector() -> str | None:
-    """Render the account picker: an existing `account_id` or "+ Nova conta".
+def _bump_data_version() -> None:
+    """Invalidate cached dashboard aggregations after any write."""
+    st.session_state["data_version"] = st.session_state.get("data_version", 0) + 1
 
-    On selecting an existing account, loads its AccountProfile via
-    `csv_mapper.load_profile` into `session_state["bank_profile"]` and sets
-    `session_state["active_account_id"]`. On "+ Nova conta", clears
-    `active_account_id` so `render_account_creation_form` takes over.
 
-    Returns:
-        The selected account_id, or None while creating a new account.
-    """
-    st.header("1. Selecionar ou criar conta")
+def _reset_pipeline_state() -> None:
+    """Clear per-file import pipeline state."""
+    for key in _PIPELINE_STATE_KEYS:
+        st.session_state[key] = None
+    st.session_state["header_row"] = 0
+    for key in list(st.session_state.keys()):
+        if key.startswith(_PIPELINE_WIDGET_PREFIXES):
+            del st.session_state[key]
 
-    existing_accounts = csv_mapper.list_profiles()
-    options = [NEW_ACCOUNT_LABEL] + existing_accounts
-    active_account_id = st.session_state.get("active_account_id")
-    default_index = options.index(active_account_id) if active_account_id in options else 0
-    # Key is derived from active_account_id (not a fixed constant), so when
-    # it changes programmatically (e.g. right after a new account is
-    # created in render_mapping_section), the widget re-anchors to it on
-    # the next rerun instead of snapping back to "+ Nova conta".
-    choice = st.selectbox(
-        "Conta", options, index=default_index, key=f"account_choice_{active_account_id or 'new'}"
+
+def _detect_source_type(filename: str) -> str | None:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    return _EXTENSION_TO_SOURCE.get(ext)
+
+
+# ---------------------------------------------------------------------------
+# Ingestion UI (shared by onboarding)
+# ---------------------------------------------------------------------------
+def _ingest_csv_ui(raw_bytes: bytes) -> file_ingest.RawTable | None:
+    """Render CSV dialect controls (pre-filled with sniffer guesses) + ingest."""
+    st.markdown("**Dialeto do CSV** (ajuste se necessário)")
+    guess = st.session_state.get("csv_guess")
+    if guess is None:
+        guess = file_ingest.sniff_csv(raw_bytes)
+        st.session_state["csv_guess"] = guess
+
+    col1, col2, col3, col4 = st.columns(4)
+    delimiter = col1.text_input("Delimitador", value=guess.delimiter, key="csv_delimiter")
+    encoding = col2.selectbox(
+        "Codificação", ["utf-8", "latin-1"],
+        index=0 if guess.encoding == "utf-8" else 1, key="csv_encoding",
+    )
+    decimal_separator = col3.selectbox(
+        "Separador decimal", [",", "."],
+        index=0 if guess.decimal_separator == "," else 1, key="csv_decimal",
+    )
+    thousands_options = [".", ",", ""]
+    thousands_separator = col4.selectbox(
+        "Separador de milhar", thousands_options,
+        index=thousands_options.index(guess.thousands_separator)
+        if guess.thousands_separator in thousands_options else 0,
+        key="csv_thousands",
     )
 
-    if choice == NEW_ACCOUNT_LABEL:
-        st.session_state["active_account_id"] = None
-        st.session_state["bank_profile"] = None
+    dialect = file_ingest.CsvDialect(
+        delimiter=delimiter or ",", encoding=encoding,
+        decimal_separator=decimal_separator, thousands_separator=thousands_separator,
+    )
+    st.session_state["csv_dialect"] = dialect
+    st.session_state["header_row"] = 0
+    try:
+        return file_ingest.read_csv(raw_bytes, dialect)
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user
+        st.error(f"Não foi possível ler o CSV: {exc}")
         return None
 
-    if st.session_state.get("active_account_id") != choice:
-        profile = csv_mapper.load_profile(choice)
-        if profile is None:
-            st.error(f"Não foi possível carregar o perfil da conta '{choice}'.")
+
+def _ingest_excel_ui(raw_bytes: bytes) -> file_ingest.RawTable | None:
+    """Render Excel sheet + header-row controls and ingest the chosen sheet."""
+    try:
+        sheets = file_ingest.list_excel_sheets(raw_bytes)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Não foi possível ler o arquivo Excel: {exc}")
+        return None
+    sheet = st.selectbox("Planilha", sheets, key="xls_sheet")
+    header_row = st.number_input(
+        "Índice da linha de cabeçalho (0 = primeira linha)",
+        min_value=0, value=0, step=1, key="xls_header_row",
+    )
+    st.session_state["selected_sheet"] = sheet
+    st.session_state["header_row"] = int(header_row)
+    try:
+        return file_ingest.read_excel(raw_bytes, sheet, int(header_row))
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Não foi possível ler a planilha: {exc}")
+        return None
+
+
+def _ingest_pdf_ui(raw_bytes: bytes) -> file_ingest.RawTable | None:
+    """Render PDF strategy + header-row controls, ingest, gate on manual review."""
+    strategy = st.selectbox(
+        "Estratégia de extração", ["stream", "lattice"],
+        format_func=lambda v: _PDF_STRATEGY_LABELS[v], key="pdf_strategy_choice",
+    )
+    header_row = st.number_input(
+        "Índice da linha de cabeçalho (0 = primeira linha)",
+        min_value=0, value=0, step=1, key="pdf_header_row",
+    )
+    st.session_state["pdf_strategy"] = strategy
+    st.session_state["header_row"] = int(header_row)
+    result = file_ingest.read_pdf(raw_bytes, strategy, int(header_row))
+    st.session_state["pdf_extraction"] = result
+    for warning in result.warnings:
+        st.warning(warning)
+    if result.raw_table is None:
+        return None
+    if result.needs_manual_review:
+        if not st.checkbox(
+            "Confirmo que revisei a extração do PDF e os dados estão corretos.", key="pdf_confirm"
+        ):
+            st.info("Marque a confirmação para prosseguir com os dados extraídos do PDF.")
             return None
-        st.session_state["active_account_id"] = choice
-        st.session_state["bank_profile"] = profile
-        st.session_state["sanitized_df"] = None
-        st.session_state["categorized_df"] = None
-        st.session_state["pending_new_account"] = None
-
-    st.success(f"Conta ativa: {choice}")
-    return choice
+    return result.raw_table
 
 
-def render_account_creation_form() -> dict | None:
-    """Render the new-account form: account_id, account_type, bank_name, locale,
-    sign convention, invert_sign, default_currency, internal_transfer_regex.
+def render_file_ingest_section() -> file_ingest.RawTable | None:
+    """Upload + ingest step: accept CSV/XLS/XLSX/PDF and produce a `RawTable`."""
+    st.header("1. Enviar arquivo")
+    uploaded = st.file_uploader(
+        "Selecione o arquivo (CSV, XLS, XLSX ou PDF)",
+        type=["csv", "xls", "xlsx", "pdf"], key="file_uploader",
+    )
+    if uploaded is None:
+        return None
+    data = uploaded.getvalue()
+    signature = hashlib.sha256(data).hexdigest()
+    if signature != st.session_state.get("uploaded_sig"):
+        _reset_pipeline_state()
+        st.session_state["uploaded_sig"] = signature
+        st.session_state["uploaded_bytes"] = data
+        st.session_state["source_type"] = _detect_source_type(uploaded.name)
 
-    Column mapping (which CSV column maps to date/amount/description/etc.)
-    is deferred to `render_mapping_section`, since it requires the uploaded
-    CSV's header row. This form collects everything else and stores it as a
-    pending draft in `session_state["pending_new_account"]`.
+    source_type = st.session_state.get("source_type")
+    if source_type == "csv":
+        raw = _ingest_csv_ui(data)
+    elif source_type == "xls":
+        raw = _ingest_excel_ui(data)
+    elif source_type == "pdf":
+        raw = _ingest_pdf_ui(data)
+    else:
+        st.error("Tipo de arquivo não suportado.")
+        return None
+    st.session_state["raw_table"] = raw
+    return raw
 
-    Returns:
-        The pending profile-fields dict, or None until the form is submitted.
-    """
-    st.header("1b. Detalhes da nova conta")
 
-    with st.form("account_creation_form"):
-        account_id = st.text_input("Identificador da conta (ex: nubank_cc)")
+def render_column_preview(raw: file_ingest.RawTable) -> None:
+    """Show the detected columns and sample values from an ingested `RawTable`."""
+    st.subheader("Colunas detectadas")
+    st.write(", ".join(raw.columns) if raw.columns else "(nenhuma coluna detectada)")
+    st.caption(f"{raw.row_count} linha(s) detectada(s). Amostra:")
+    st.dataframe(pd.DataFrame(raw.sample_rows), use_container_width=True)
+
+
+def render_reuse_offer(raw: file_ingest.RawTable) -> AccountProfile | None:
+    """If a saved profile's schema_fingerprint matches, offer one-click reuse."""
+    fingerprint = csv_mapper.compute_schema_fingerprint(raw.columns)
+    match = csv_mapper.find_profile_by_fingerprint(fingerprint)
+    if match is None:
+        return None
+    st.header("2. Perfil correspondente encontrado")
+    st.info(f"Um mapeamento salvo corresponde a este arquivo (conta '{match.account_id}').")
+    if st.button("Reaproveitar mapeamento salvo", key="reuse_confirm"):
+        return match
+    st.caption("Ou crie um novo mapeamento abaixo.")
+    return None
+
+
+def render_account_binding(raw: file_ingest.RawTable) -> dict | None:
+    """Bind the uploaded file to an existing account or a brand-new one."""
+    st.header("3. Vincular a uma conta")
+    existing = csv_mapper.list_profiles()
+    choice = st.selectbox("Conta", [NEW_ACCOUNT_LABEL] + existing, key="bind_choice")
+    if choice == NEW_ACCOUNT_LABEL:
+        account_id = st.text_input("Identificador da conta (ex.: nubank_cc)", key="bind_account_id")
         account_type = st.selectbox(
             "Tipo de conta", [t.value for t in AccountType],
-            format_func=lambda v: "Conta bancária" if v == "bank_account" else "Cartão de crédito",
+            format_func=lambda v: _ACCOUNT_TYPE_LABELS[v], key="bind_account_type",
         )
-        bank_name = st.text_input("Nome do banco/instituição")
-        default_currency = st.selectbox("Moeda padrão", [c.value for c in Currency])
-        amount_sign_convention = st.selectbox(
-            "Convenção de sinal do valor",
-            [c.value for c in AmountSignConvention],
-            format_func=lambda v: {
-                "signed": "Coluna única com sinal",
-                "debit_credit_columns": "Colunas separadas de débito/crédito",
-                "parentheses": "Negativos entre parênteses",
-            }[v],
-        )
-        invert_sign = st.checkbox(
-            "Inverter sinal (ex: cartão de crédito lista compras como positivo)"
-        )
-        date_format = st.text_input("Formato de data (ex: %d/%m/%Y)", value="%d/%m/%Y")
-        decimal_separator = st.selectbox("Separador decimal", [",", "."])
-        thousands_separator = st.selectbox("Separador de milhar", [".", ",", ""])
-        encoding = st.text_input("Codificação do arquivo", value="utf-8")
-        delimiter = st.text_input("Delimitador do CSV", value=",")
-        skip_rows_regex = st.text_input(
-            "Regex para ignorar linhas (rodapé/cabeçalho embutido)",
-            value="^(Saldo|Total|Balance)",
-        )
-        internal_transfer_regex = st.text_input(
-            "Regex para transferência interna (ex: pagamento de fatura)",
-            value="(?i)PAG.*FATURA|PGTO CARTAO|BILL PAYMENT",
-        )
-        submitted = st.form_submit_button("Continuar para mapeamento de colunas")
-
-    if not submitted:
+        bank_name = st.text_input("Nome do banco/instituição", key="bind_bank_name")
+        if not account_id.strip() or not bank_name.strip():
+            st.info("Preencha o identificador e o nome do banco para continuar.")
+            return None
+        return {"account_id": account_id.strip(), "account_type": account_type, "bank_name": bank_name.strip()}
+    profile = csv_mapper.load_profile(choice)
+    if profile is None:
+        st.error("Falha ao carregar a conta selecionada.")
         return None
-
-    if not account_id.strip() or not bank_name.strip():
-        st.error("Informe um identificador de conta e um nome de banco válidos.")
-        return None
-
-    if account_id.strip() in csv_mapper.list_profiles():
-        st.error(f"Já existe uma conta com o identificador '{account_id.strip()}'.")
-        return None
-
-    pending = {
-        "account_id": account_id.strip(),
-        "account_type": account_type,
-        "bank_name": bank_name.strip(),
-        "invert_sign": invert_sign,
-        "date_format": date_format,
-        "decimal_separator": decimal_separator,
-        "thousands_separator": thousands_separator,
-        "encoding": encoding.strip() or "utf-8",
-        "delimiter": delimiter.strip() or ",",
-        "amount_sign_convention": amount_sign_convention,
-        "default_currency": default_currency,
-        "skip_rows_regex": skip_rows_regex,
-        "internal_transfer_regex": internal_transfer_regex,
-    }
-    st.session_state["pending_new_account"] = pending
-    return pending
+    return {"account_id": choice, "account_type": profile.account_type.value, "bank_name": profile.bank_name}
 
 
-def render_upload_section() -> bytes | None:
-    """Render the CSV file uploader, scoped to the active account.
-
-    Returns:
-        The raw uploaded file bytes, or None if nothing has been uploaded
-        yet in this session for the active account.
-    """
-    st.header("2. Importar extrato (CSV)")
-    uploaded_file = st.file_uploader("Selecione o arquivo CSV", type=["csv"], key="csv_uploader")
-
-    if uploaded_file is not None:
-        st.session_state["uploaded_bytes"] = uploaded_file.getvalue()
-
-    return st.session_state.get("uploaded_bytes")
-
-
-def render_mapping_section(raw_bytes: bytes) -> AccountProfile | None:
-    """Render CSV column mapping controls when the active account's profile
-    does not yet fully cover the uploaded file's columns.
-
-    For an existing account profile, auto-applies the saved mapping without
-    prompting. For a fresh profile still being built (from
-    `render_account_creation_form`), presents column dropdowns bound to the
-    uploaded CSV's header row and persists the completed mapping.
-
-    Args:
-        raw_bytes: The uploaded CSV's raw bytes, for header introspection.
-
-    Returns:
-        The AccountProfile to use for processing, or None until mapping is complete.
-    """
-    existing_profile = st.session_state.get("bank_profile")
-    if existing_profile is not None:
-        return existing_profile
-
-    pending = st.session_state.get("pending_new_account")
-    if pending is None:
-        return None
-
-    st.header("3. Mapear colunas")
-
-    try:
-        header_preview = pd.read_csv(
-            io.BytesIO(raw_bytes), nrows=5, dtype=str, engine="python", delimiter=pending["delimiter"]
-        )
-    except Exception as exc:  # noqa: BLE001 - surfaced directly to the user
-        st.error(f"Não foi possível ler o CSV enviado: {exc}")
-        return None
-
-    available_columns = list(header_preview.columns)
-    st.caption("Prévia das primeiras linhas do arquivo:")
-    st.dataframe(header_preview, use_container_width=True)
-
-    convention = pending["amount_sign_convention"]
-
-    with st.form("column_mapping_form"):
-        date_column = st.selectbox("Coluna de data", available_columns)
-        description_column = st.selectbox("Coluna de descrição", available_columns)
-
-        amount_column = None
-        debit_column = None
-        credit_column = None
-        if convention == AmountSignConvention.DEBIT_CREDIT_COLUMNS.value:
-            debit_column = st.selectbox("Coluna de débito", available_columns)
-            credit_column = st.selectbox("Coluna de crédito", available_columns)
-        else:
-            amount_column = st.selectbox("Coluna de valor", available_columns)
-
-        use_currency_column = st.checkbox("Moeda varia por linha (coluna própria)?")
-        currency_column = None
-        if use_currency_column:
-            currency_column = st.selectbox("Coluna de moeda", available_columns)
-
-        submitted = st.form_submit_button("Salvar mapeamento e continuar")
-
-    if not submitted:
-        return None
-
+def _build_profile(binding: dict, mr: "mapping_ui.MappingResult", raw: file_ingest.RawTable) -> AccountProfile:
+    """Assemble an `AccountProfile` from the binding + mapping + ingest provenance."""
+    source_type = st.session_state.get("source_type")
+    if source_type == "csv":
+        dialect = st.session_state.get("csv_dialect")
+        delimiter, encoding = dialect.delimiter, dialect.encoding
+    else:
+        delimiter, encoding = BRIDGE_DELIMITER, "utf-8"
     column_map = ColumnMap(
-        date=date_column,
-        amount=amount_column,
-        debit=debit_column,
-        credit=credit_column,
-        description=description_column,
-        currency=currency_column,
+        date=mr.mapping_dict.get("date"), amount=mr.mapping_dict.get("amount"),
+        debit=mr.mapping_dict.get("debit"), credit=mr.mapping_dict.get("credit"),
+        description=mr.mapping_dict.get("description"), currency=mr.mapping_dict.get("currency"),
+    )
+    return AccountProfile(
+        account_id=binding["account_id"], account_type=AccountType(binding["account_type"]),
+        bank_name=binding["bank_name"], invert_sign=mr.invert_sign, column_map=column_map,
+        date_format=mr.date_format, decimal_separator=mr.decimal_separator,
+        thousands_separator=mr.thousands_separator, encoding=encoding, delimiter=delimiter,
+        amount_sign_convention=AmountSignConvention(mr.amount_sign_convention),
+        default_currency=Currency(mr.default_currency), skip_rows_regex=mr.skip_rows_regex,
+        internal_transfer_regex=mr.internal_transfer_regex, source_type=source_type,
+        sheet_name=raw.sheet_name, header_row=int(st.session_state.get("header_row", 0)),
+        pdf_strategy=raw.pdf_strategy, schema_fingerprint=csv_mapper.compute_schema_fingerprint(raw.columns),
     )
 
-    profile = AccountProfile(
-        account_id=pending["account_id"],
-        account_type=AccountType(pending["account_type"]),
-        bank_name=pending["bank_name"],
-        invert_sign=pending["invert_sign"],
-        column_map=column_map,
-        date_format=pending["date_format"],
-        decimal_separator=pending["decimal_separator"],
-        thousands_separator=pending["thousands_separator"],
-        encoding=pending["encoding"],
-        delimiter=pending["delimiter"],
-        amount_sign_convention=AmountSignConvention(convention),
-        default_currency=Currency(pending["default_currency"]),
-        skip_rows_regex=pending["skip_rows_regex"],
-        internal_transfer_regex=pending["internal_transfer_regex"],
-    )
 
-    try:
-        csv_mapper.save_profile(profile)
-    except OSError as exc:
-        st.error(f"Falha ao salvar o perfil de mapeamento: {exc}")
+def _sample_csv_bytes(raw: file_ingest.RawTable, profile: AccountProfile) -> bytes:
+    return file_ingest.raw_table_to_csv_bytes(raw, profile.delimiter, profile.encoding)
+
+
+def render_validate_and_save(raw, mr, binding) -> AccountProfile | None:
+    """Validate the mapping, dry-run parse the sample, then save the profile."""
+    st.header("4. Validar e salvar")
+    if not mr.is_valid:
+        for error in mr.errors:
+            st.error(error)
         return None
+    profile = _build_profile(binding, mr, raw)
+    try:
+        sample_df = csv_mapper.process_csv(_sample_csv_bytes(raw, profile), profile)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Falha ao interpretar a amostra com este mapeamento: {exc}")
+        return None
+    if sample_df.empty:
+        st.warning("A amostra não produziu nenhuma linha válida. Revise o mapeamento e a localização.")
+        return None
+    display = sample_df.copy()
+    display["sinal"] = display["amount"].map(lambda a: "negativo" if a < 0 else "positivo")
+    st.caption("Prévia da interpretação da amostra (data, valor, sinal, moeda):")
+    st.dataframe(
+        display[["date", "amount", "sinal", "currency", "description", "is_internal_transfer"]],
+        use_container_width=True,
+    )
+    if st.button("Salvar perfil e continuar", key="save_profile_btn"):
+        try:
+            csv_mapper.save_profile(profile)
+        except OSError as exc:
+            st.error(f"Falha ao salvar o perfil: {exc}")
+            return None
+        conn = _get_db_connection()
+        db.upsert_account(conn, profile)
+        st.session_state["bank_profile"] = profile
+        st.session_state["active_account_id"] = profile.account_id
+        st.success(f"Perfil da conta '{profile.account_id}' salvo.")
+        st.rerun()
+    return None
 
-    conn = _get_db_connection()
-    db.upsert_account(conn, profile)
 
-    st.session_state["bank_profile"] = profile
-    # Setting active_account_id here re-anchors the account selector widget
-    # (keyed off active_account_id) to this account on the NEXT rerun,
-    # instead of falling back to "+ Nova conta" and wiping this state.
-    st.session_state["active_account_id"] = profile.account_id
-    st.session_state["pending_new_account"] = None
-    st.success(f"Conta '{profile.account_id}' criada e mapeamento salvo.")
-    return profile
+# ---------------------------------------------------------------------------
+# Ingest -> full canonical bytes bridge (profile-driven; reused by both flows)
+# ---------------------------------------------------------------------------
+def _full_csv_bytes_for(profile: AccountProfile, data: bytes, source_type: str | None = None) -> bytes:
+    """Re-ingest a file's FULL content via the profile's provenance, then bridge.
 
-
-def render_preview_section(raw_bytes: bytes, profile: AccountProfile) -> pd.DataFrame | None:
-    """Run `csv_mapper.process_csv` and display the sanitized transaction preview.
-
-    Persists the result to `session_state["sanitized_df"]` and, on user
-    confirmation, writes it to SQLite via `db.insert_transactions`
-    (idempotent — re-imports report zero new rows).
-
-    Args:
-        raw_bytes: The uploaded CSV's raw bytes.
-        profile: The resolved account profile to sanitize with.
-
-    Returns:
-        The sanitized DataFrame, or None if processing failed (error is
-        surfaced to the user via `st.error` in pt_BR).
+    `source_type` overrides `profile.source_type` (which may be None for a
+    legacy profile saved before provenance fields existed); it defaults to CSV.
     """
-    st.header("4. Prévia dos dados sanitizados")
+    st_type = source_type or profile.source_type or "csv"
+    if st_type == "csv":
+        dialect = file_ingest.CsvDialect(
+            delimiter=profile.delimiter, encoding=profile.encoding,
+            decimal_separator=profile.decimal_separator, thousands_separator=profile.thousands_separator,
+        )
+        full = file_ingest.read_csv(data, dialect, max_rows=None)
+    elif st_type == "xls":
+        full = file_ingest.read_excel(data, profile.sheet_name, profile.header_row, max_rows=None)
+    else:  # pdf
+        result = file_ingest.read_pdf(data, profile.pdf_strategy or "stream", profile.header_row, max_rows=None)
+        if result.raw_table is None:
+            raise ValueError("Extração de PDF indisponível para importação completa.")
+        full = result.raw_table
+    return file_ingest.raw_table_to_csv_bytes(full, profile.delimiter, profile.encoding)
 
+
+def _sample_columns_for(profile: AccountProfile, data: bytes, source_type: str | None = None) -> list[str] | None:
+    """Ingest just the columns of a file via the profile's provenance (for fingerprinting)."""
+    st_type = source_type or profile.source_type or "csv"
     try:
-        sanitized_df = csv_mapper.process_csv(raw_bytes, profile)
-    except ValueError as exc:
-        st.error(f"Erro no mapeamento de colunas: {exc}")
-        return None
-    except Exception as exc:  # noqa: BLE001 - surfaced directly to the user
-        st.error(f"Erro ao processar o CSV: {exc}")
+        if st_type == "csv":
+            dialect = file_ingest.CsvDialect(
+                delimiter=profile.delimiter, encoding=profile.encoding,
+                decimal_separator=profile.decimal_separator, thousands_separator=profile.thousands_separator,
+            )
+            return file_ingest.read_csv(data, dialect).columns
+        if st_type == "xls":
+            return file_ingest.read_excel(data, profile.sheet_name, profile.header_row).columns
+        result = file_ingest.read_pdf(data, profile.pdf_strategy or "stream", profile.header_row)
+        return result.raw_table.columns if result.raw_table else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not read columns for fingerprinting: %s", exc)
         return None
 
+
+def render_canonical_preview_and_import(profile: AccountProfile) -> pd.DataFrame | None:
+    """Onboarding: run process_csv on the full file, preview, and import."""
+    st.header("5. Prévia canônica e importação")
+    try:
+        sanitized_df = csv_mapper.process_csv(_full_csv_bytes_for(profile, st.session_state["uploaded_bytes"]), profile)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Erro ao processar o arquivo: {exc}")
+        return None
     if sanitized_df.empty:
         st.warning("Nenhuma transação válida foi encontrada após a sanitização dos dados.")
         return None
-
     st.session_state["sanitized_df"] = sanitized_df
     st.dataframe(sanitized_df, use_container_width=True)
-    st.caption(f"{len(sanitized_df)} transações válidas encontradas.")
-
-    if st.button("Salvar transações no banco de dados local"):
+    st.caption(f"{len(sanitized_df)} transações válidas. Conta ativa: {profile.account_id}.")
+    if st.button("Importar transações no banco de dados local", key="import_btn"):
         conn = _get_db_connection()
         inserted = db.insert_transactions(conn, sanitized_df)
+        st.session_state["last_import_hashes"] = tuple(sanitized_df["transaction_hash"])
+        st.session_state["last_import_account"] = profile.account_id
+        _bump_data_version()
         st.success(f"{inserted} novas transações importadas (duplicatas foram ignoradas).")
-
     return sanitized_df
 
 
-def render_categorization_section() -> pd.DataFrame | None:
-    """Trigger `ai_services.categorize_transactions` for the active account's
-    sanitized (non-internal-transfer) rows, showing a pt_BR loading spinner.
-
-    Reuses and updates `session_state["category_cache"]` so repeated
-    merchants across accounts are categorized once. Internal-transfer rows
-    keep their forced "Transferência interna" category and are skipped.
-
-    Returns:
-        The categorized DataFrame, or None until the user triggers
-        categorization or if the Ollama call fails (error surfaced in pt_BR).
-    """
-    sanitized_df = st.session_state.get("sanitized_df")
-    if sanitized_df is None:
-        return None
-
-    st.header("5. Categorização automática com IA local")
-
-    if st.button("Categorizar transações com IA"):
-        categories = _load_categories_taxonomy()
-        categorizable_mask = ~sanitized_df["is_internal_transfer"]
-        categorizable_df = sanitized_df[categorizable_mask]
-
-        with st.spinner("Categorizando transações com o modelo local..."):
-            try:
-                description_to_category = ai_services.categorize_transactions(
-                    categorizable_df["description"].tolist(),
-                    categories=categories,
-                    cache=st.session_state["category_cache"],
-                )
-            except Exception as exc:  # noqa: BLE001 - surfaced directly to the user
-                st.error(f"Falha ao categorizar transações: {exc}")
-                return None
-
-        categorized_df = sanitized_df.copy()
-        categorized_df.loc[categorizable_mask, "category"] = categorized_df.loc[
-            categorizable_mask, "description"
-        ].map(description_to_category)
-
-        conn = _get_db_connection()
-        category_by_hash = dict(zip(categorized_df["transaction_hash"], categorized_df["category"]))
-        db.update_categories(conn, category_by_hash)
-
-        st.session_state["categorized_df"] = categorized_df
-
-    categorized_df = st.session_state.get("categorized_df")
-    if categorized_df is not None:
-        st.dataframe(categorized_df, use_container_width=True)
-
-    return categorized_df
-
-
-def render_budget_editor() -> dict[str, dict[str, float]]:
-    """Render per-category, per-currency budget input fields.
-
-    Persists edits to `session_state["budget_by_category"]`
-    (`{currency: {category: planned_amount}}`), the source of truth consumed
-    by `render_insights_section`.
-
-    Returns:
-        The current budget mapping after this render pass.
-    """
-    st.subheader("Orçamento planejado")
-
-    conn = _get_db_connection()
-    aggregates = db.compute_spending_aggregates(conn)
-    currencies_present = sorted({agg["currency"] for agg in aggregates})
-
-    if not currencies_present:
-        st.caption("Nenhum gasto registrado ainda.")
-        return st.session_state["budget_by_category"]
-
-    for currency in currencies_present:
-        st.markdown(f"**{currency}**")
-        categories_for_currency = sorted(
-            {cat for agg in aggregates if agg["currency"] == currency for cat in agg["category_totals"]}
-        )
-        currency_budgets = st.session_state["budget_by_category"].setdefault(currency, {})
-        for category in categories_for_currency:
-            default_value = currency_budgets.get(category, 0.0)
-            value = st.number_input(
-                f"Orçamento - {category} ({currency})",
-                min_value=0.0,
-                value=float(default_value),
-                step=50.0,
-                key=f"budget_{currency}_{category}",
+# ---------------------------------------------------------------------------
+# Categorization (new rows only; respects manual + internal transfer)
+# ---------------------------------------------------------------------------
+def _categorize_hashes(conn: sqlite3.Connection, only_hashes: tuple[str, ...] | None) -> int:
+    """Categorize eligible rows (optionally scoped to `only_hashes`). Returns count."""
+    todo = db.fetch_categorizable(conn, only_hashes=only_hashes)
+    if todo.empty:
+        st.info("Nenhuma transação nova elegível para categorização.")
+        return 0
+    categories = _load_categories_taxonomy()
+    with st.spinner("Categorizando transações com o modelo local..."):
+        try:
+            mapping = ai_services.categorize_transactions(
+                todo["description"].tolist(), categories=categories,
+                cache=st.session_state["category_cache"],
             )
-            currency_budgets[category] = value
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Falha ao categorizar transações: {exc}")
+            return 0
+    cat_by_hash = {h: mapping.get(d, "Outros") for h, d in zip(todo["transaction_hash"], todo["description"])}
+    updated = db.apply_llm_categories(conn, cat_by_hash)
+    _bump_data_version()
+    return updated
 
-    return st.session_state["budget_by_category"]
+
+def _render_post_import(conn: sqlite3.Connection, account_id: str) -> None:
+    """Offer to categorize only the just-imported rows, then a finish action."""
+    new_hashes = st.session_state.get("last_import_hashes")
+    if not new_hashes or st.session_state.get("last_import_account") != account_id:
+        return
+    st.header("6. Categorizar novas transações")
+    if st.button("Categorizar novas transações com IA", key="cat_new_onb"):
+        n = _categorize_hashes(conn, new_hashes)
+        if n:
+            st.success(f"{n} transações categorizadas.")
+    if st.button("Concluir e ir para o painel", key="finish_onboarding"):
+        _reset_pipeline_state()
+        st.session_state["onboarding_active"] = False
+        st.session_state["uploaded_sig"] = None
+        st.rerun()
 
 
-def render_insights_section() -> None:
-    """Render the two insight views and trigger `ai_services.generate_financial_insights`.
-
-    Views:
-        (a) Per-account: spend vs. budget for the single active account.
-        (b) Consolidated: spend vs. budget aggregated across all accounts
-            sharing the same currency (never mixed across BRL/EUR).
-    Internal transfers are excluded from both. Displays a pt_BR loading
-    spinner while the Ollama call is in flight.
-    """
-    st.header("6. Insights de conciliação orçamentária")
-
-    budget_by_category = render_budget_editor()
-    budget_entries = [
-        {"category": category, "currency": currency, "planned_amount": amount}
-        for currency, categories in budget_by_category.items()
-        for category, amount in categories.items()
-    ]
-
+# ---------------------------------------------------------------------------
+# ONBOARDING (0 accounts, or "Nova conta" from Configurações)
+# ---------------------------------------------------------------------------
+def render_onboarding() -> None:
+    """Full upload-first import flow, including account creation."""
+    st.title("Gestão Financeira Pessoal — configuração de conta")
     conn = _get_db_connection()
-    active_account_id = st.session_state.get("active_account_id")
-
-    view = st.radio("Visão", ["Por conta", "Consolidada (mesma moeda)"], horizontal=True)
-
-    if view == "Por conta":
-        if not active_account_id:
-            st.caption("Selecione uma conta para ver os insights por conta.")
-            return
-        aggregates = db.compute_spending_aggregates(conn, account_id=active_account_id)
-    else:
-        aggregates = db.compute_spending_aggregates(conn)
-
-    if not aggregates:
-        st.caption("Nenhum gasto registrado ainda para gerar insights.")
+    raw = render_file_ingest_section()
+    if raw is None:
+        st.caption("Envie um extrato para começar.")
         return
+    render_column_preview(raw)
 
-    if st.button("Gerar insights com IA"):
-        with st.spinner("Gerando análise executiva com o modelo local..."):
-            insights_text = ai_services.generate_financial_insights(aggregates, budget_entries)
-        st.session_state["insights_text"] = insights_text
-
-    insights_text = st.session_state.get("insights_text")
-    if insights_text:
-        st.subheader("Resumo executivo")
-        st.write(insights_text)
-
-
-# ---------------------------------------------------------------------------
-# Interactive-import pipeline (Phase 1 contracts — NOT yet wired into main()).
-#
-# These stubs describe the NEW pipeline order that will REPLACE the current
-# "Select/Create Account -> Upload -> Map" section in Phase 2:
-#
-#   1. Upload (CSV / XLS / XLSX / PDF)
-#   2. Ingest  -> file_ingest -> RawTable (+ CsvDialect / sheet / PDF review)
-#   3. Show detected columns + sample values
-#   4. Bind file to account (existing OR "Nova conta")
-#   5. Visual drag-and-drop mapping (mapping_ui.render_mapping_ui)
-#   6. Declare locale / sign / currency / internal_transfer_regex
-#   7. Validate + preview canonical DataFrame -> Save profile
-#
-# Categorize / Insights downstream stages are unchanged. main() is left on the
-# current working flow until these bodies land in Phase 2.
-# ---------------------------------------------------------------------------
-
-
-def render_file_ingest_section() -> "file_ingest.RawTable | None":
-    """Upload + ingest step: accept CSV/XLS/XLSX/PDF and produce a `RawTable`.
-
-    Dispatches on file type: CSV via `sniff_csv` (+ user-overridable dialect
-    widgets) -> `read_csv`; Excel via `list_excel_sheets` + sheet/header-row
-    pickers -> `read_excel`; PDF via strategy/header-row pickers -> `read_pdf`,
-    surfacing `PdfExtractionResult.warnings` and requiring confirmation when
-    `needs_manual_review` is True. Persists the result and its provenance
-    (`raw_table`, `source_type`, `csv_dialect`, `selected_sheet`,
-    `header_row`, `pdf_extraction`) to session_state.
-
-    Returns:
-        The ingested `RawTable`, or None until a file is ingested (or when a
-        PDF extraction still awaits manual review/abort).
-
-    Raises:
-        NotImplementedError: Phase 2 implementation pending.
-    """
-    raise NotImplementedError
-
-
-def render_column_preview(raw: "file_ingest.RawTable") -> None:
-    """Show the detected columns and sample values from an ingested `RawTable`.
-
-    Args:
-        raw: The ingested source-agnostic table to preview.
-
-    Raises:
-        NotImplementedError: Phase 2 implementation pending.
-    """
-    raise NotImplementedError
-
-
-def render_account_binding(raw: "file_ingest.RawTable") -> str | None:
-    """Bind the uploaded file to an account (existing or "Nova conta").
-
-    Computes `csv_mapper.compute_schema_fingerprint(raw.columns)` and, if
-    `csv_mapper.find_profile_by_fingerprint` matches a saved profile, offers a
-    one-click "Reaproveitar mapeamento salvo" that skips the visual mapping
-    step entirely.
-
-    Args:
-        raw: The ingested table whose column fingerprint is checked for reuse.
-
-    Returns:
-        The bound account_id, or None while a new account is being created.
-
-    Raises:
-        NotImplementedError: Phase 2 implementation pending.
-    """
-    raise NotImplementedError
-
-
-def render_visual_mapping_section(raw: "file_ingest.RawTable") -> "mapping_ui.MappingResult | None":
-    """Run the drag-and-drop mapping step and stash its `MappingResult`.
-
-    Seeds the buckets with `mapping_ui.suggest_mapping(raw.columns)`, renders
-    `mapping_ui.render_mapping_ui`, and persists the result to
-    `session_state["mapping_result"]`.
-
-    Args:
-        raw: The ingested table being mapped.
-
-    Returns:
-        The current `MappingResult`, or None until the user completes mapping.
-
-    Raises:
-        NotImplementedError: Phase 2 implementation pending.
-    """
-    raise NotImplementedError
-
-
-def render_mapping_validation_and_save(
-    raw: "file_ingest.RawTable",
-    mapping_result: "mapping_ui.MappingResult",
-    account_id: str,
-) -> "AccountProfile | None":
-    """Dry-run + validate the mapping on sample rows, then save the profile.
-
-    Assembles a candidate `AccountProfile` (mapping + locale + the import
-    provenance fields: `source_type`, `sheet_name`, `header_row`,
-    `pdf_strategy`, `schema_fingerprint`), dry-runs `csv_mapper.process_csv`
-    over `raw.sample_rows` to display parsed date / amount / sign / currency,
-    and refuses to save if parsing fails. On success persists via
-    `csv_mapper.save_profile` + `db.upsert_account`.
-
-    Args:
-        raw: The ingested table (its sample rows drive the dry run).
-        mapping_result: The validated mapping/locale declarations.
-        account_id: The bound account identifier.
-
-    Returns:
-        The saved `AccountProfile`, or None if validation failed or the user
-        has not confirmed the save.
-
-    Raises:
-        NotImplementedError: Phase 2 implementation pending.
-    """
-    raise NotImplementedError
-
-
-def main() -> None:
-    """Entry point: wires the full Select Account -> Upload -> Map -> Preview
-    -> Categorize -> Insights pipeline in order, gated on session_state so
-    each stage only renders once its prerequisite state is populated.
-    """
-    st.set_page_config(page_title="Gestão Financeira Pessoal", layout="wide")
-    st.title("Gestão Financeira Pessoal — MVP")
-
-    init_session_state()
-    _get_db_connection()
-
-    account_id = render_account_selector()
-
-    if account_id is None:
-        render_account_creation_form()
-
-    raw_bytes = render_upload_section()
-    if raw_bytes is None:
-        return
-
-    profile = render_mapping_section(raw_bytes)
+    profile = st.session_state.get("bank_profile")
     if profile is None:
-        return
+        reused = render_reuse_offer(raw)
+        if reused is not None:
+            st.session_state["bank_profile"] = reused
+            st.session_state["active_account_id"] = reused.account_id
+            st.rerun()
+        binding = render_account_binding(raw)
+        if binding is None:
+            return
+        suggested = mapping_ui.suggest_mapping(raw.columns)
+        mapping_result = mapping_ui.render_mapping_ui(raw, suggested)
+        profile = render_validate_and_save(raw, mapping_result, binding)
+        if profile is None:
+            return
 
-    sanitized_df = render_preview_section(raw_bytes, profile)
+    sanitized_df = render_canonical_preview_and_import(profile)
     if sanitized_df is None:
         return
+    _render_post_import(conn, profile.account_id)
 
-    render_categorization_section()
-    render_insights_section()
+
+# ---------------------------------------------------------------------------
+# PAGE: Dashboard
+# ---------------------------------------------------------------------------
+def _fmt_money(value: float, currency: str) -> str:
+    return f"{currency} {value:,.2f}"
+
+
+def _delta_str(current: float, previous: float) -> str | None:
+    if previous == 0:
+        return None
+    return f"{(current - previous) / previous * 100:+.1f}%"
+
+
+def _render_dashboard(conn: sqlite3.Connection) -> None:
+    """Render the financial dashboard for a single selected currency."""
+    currencies = db.list_currencies(conn)
+    if not currencies:
+        st.info("Nenhuma transação de gasto/receita registrada ainda.")
+        return
+
+    st.title("📊 Painel financeiro")
+
+    # Currency SELECTOR (never mixes BRL/EUR).
+    currency = currencies[0] if len(currencies) == 1 else st.radio(
+        "Moeda", currencies, horizontal=True, key="dash_currency",
+        help="BRL e EUR nunca são somados ou convertidos.",
+    )
+
+    # ---- Global filters ----
+    with st.container(border=True):
+        c1, c2 = st.columns([1, 2])
+        preset = c1.selectbox("Período", analytics.PERIOD_PRESETS, key="dash_period")
+        today = date.today()
+        custom_start = custom_end = None
+        if preset == "Personalizado":
+            rng = c2.date_input(
+                "Intervalo personalizado",
+                value=(today.replace(day=1), today), key="dash_custom_range",
+            )
+            if isinstance(rng, tuple) and len(rng) == 2:
+                custom_start, custom_end = rng
+        bounds = analytics.resolve_period(preset, today, custom_start, custom_end)
+
+        c3, c4 = st.columns(2)
+        account_options = db.list_all_accounts(conn)
+        selected_accounts = c3.multiselect(
+            "Contas", account_options, default=account_options, key="dash_accounts"
+        )
+        category_options = db.list_all_categories(conn)
+        selected_categories = c4.multiselect("Categorias", category_options, default=[], key="dash_categories")
+
+    version = st.session_state["data_version"]
+    df = analytics.load_transactions(
+        version, currency, bounds.start, bounds.end,
+        tuple(sorted(selected_accounts)), tuple(sorted(selected_categories)),
+    )
+    prev_df = analytics.load_transactions(
+        version, currency, bounds.prev_start, bounds.prev_end,
+        tuple(sorted(selected_accounts)), tuple(sorted(selected_categories)),
+    )
+
+    if df.empty:
+        st.info("Nenhuma transação no período/filtros selecionados.")
+        return
+
+    # ---- KPI row ----
+    kpi, prev = analytics.compute_kpis(df), analytics.compute_kpis(prev_df)
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Total de despesas", _fmt_money(kpi["expenses"], currency),
+              delta=_delta_str(kpi["expenses"], prev["expenses"]), delta_color="inverse")
+    k2.metric("Total de receitas", _fmt_money(kpi["income"], currency),
+              delta=_delta_str(kpi["income"], prev["income"]))
+    k3.metric("Saldo líquido", _fmt_money(kpi["net"], currency),
+              delta=_delta_str(kpi["net"], prev["net"]))
+    k4.metric("Δ despesas vs. período anterior",
+              _delta_str(kpi["expenses"], prev["expenses"]) or "—")
+
+    # ---- Chart 1: monthly evolution (income/expense bars + net line) ----
+    st.subheader("Evolução mensal")
+    monthly = analytics.monthly_evolution(df)
+    if not monthly.empty:
+        melted = monthly.melt(id_vars="month", value_vars=["Receitas", "Despesas"],
+                              var_name="Tipo", value_name="Valor")
+        bars = alt.Chart(melted).mark_bar().encode(
+            x=alt.X("month:N", title="Mês"),
+            y=alt.Y("Valor:Q", title=f"Valor ({currency})"),
+            color=alt.Color("Tipo:N", scale=alt.Scale(domain=["Receitas", "Despesas"],
+                                                       range=["#2e7d32", "#c62828"])),
+            xOffset="Tipo:N",
+        )
+        line = alt.Chart(monthly).mark_line(point=True, color="#1565c0").encode(
+            x="month:N", y=alt.Y("Líquido:Q", title=f"Valor ({currency})"),
+        )
+        st.altair_chart((bars + line).resolve_scale(y="shared"), use_container_width=True)
+
+    # ---- Chart 2: expense by category (Top 10 + Outros) ----
+    st.subheader("Despesas por categoria")
+    by_cat = analytics.expense_by_category(df, top_n=10)
+    if not by_cat.empty:
+        chart = alt.Chart(by_cat).mark_bar(color="#c62828").encode(
+            x=alt.X("spend:Q", title=f"Gasto ({currency})"),
+            y=alt.Y("category:N", sort="-x", title="Categoria"),
+            tooltip=["category", "spend"],
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+    # ---- Chart 3: expense by account (only if >1 account) ----
+    if df["account_id"].nunique() > 1:
+        st.subheader("Despesas por conta")
+        by_acct = analytics.expense_by_account(df)
+        chart = alt.Chart(by_acct).mark_bar(color="#6a1b9a").encode(
+            x=alt.X("spend:Q", title=f"Gasto ({currency})"),
+            y=alt.Y("account_id:N", sort="-x", title="Conta"),
+            tooltip=["account_id", "spend"],
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+    # ---- Chart 4: budget vs actual (only categories with a budget) ----
+    budgets = db.get_budgets(conn, currency)
+    bva = analytics.budget_vs_actual(df, budgets)
+    if not bva.empty:
+        st.subheader("Orçado vs. realizado")
+        melted = bva.melt(id_vars="category", value_vars=["Orçado", "Realizado"],
+                          var_name="Tipo", value_name="Valor")
+        chart = alt.Chart(melted).mark_bar().encode(
+            x=alt.X("Valor:Q", title=f"Valor ({currency})"),
+            y=alt.Y("category:N", title="Categoria"),
+            color=alt.Color("Tipo:N", scale=alt.Scale(domain=["Orçado", "Realizado"],
+                                                       range=["#90a4ae", "#c62828"])),
+            yOffset="Tipo:N",
+        )
+        st.altair_chart(chart, use_container_width=True)
+        overruns = bva[bva["Estouro"] > 0]
+        if not overruns.empty:
+            st.warning("Estouro de orçamento: " + ", ".join(
+                f"{r.category} (+{_fmt_money(r.Estouro, currency)})" for r in overruns.itertuples()
+            ))
+
+    # ---- Transaction table ----
+    _render_transaction_table(conn, df, currency)
+
+
+def _render_transaction_table(conn: sqlite3.Connection, df: pd.DataFrame, currency: str) -> None:
+    """Filtered, searchable, inline-editable transaction table with CSV export."""
+    st.subheader("Transações")
+    s1, s2 = st.columns([2, 1])
+    search = s1.text_input("Buscar na descrição", key="tbl_search").strip()
+    focus_options = ["(todas)"] + sorted(df["category"].unique().tolist())
+    focus = s2.selectbox("Focar em categoria", focus_options, key="tbl_focus")
+
+    view = df.copy()
+    if search:
+        view = view[view["description"].str.contains(search, case=False, na=False)]
+    if focus != "(todas)":
+        view = view[view["category"] == focus]
+
+    view = view[["transaction_hash", "date", "description", "category", "amount", "account_id", "category_source"]]
+    view = view.assign(date=view["date"].dt.strftime("%Y-%m-%d")).set_index("transaction_hash")
+
+    all_categories = db.list_all_categories(conn)
+    edited = st.data_editor(
+        view,
+        column_config={
+            "category": st.column_config.SelectboxColumn("Categoria", options=all_categories, required=True),
+            "date": st.column_config.TextColumn("Data", disabled=True),
+            "description": st.column_config.TextColumn("Descrição", disabled=True),
+            "amount": st.column_config.NumberColumn("Valor", disabled=True, format="%.2f"),
+            "account_id": st.column_config.TextColumn("Conta", disabled=True),
+            "category_source": st.column_config.TextColumn("Origem", disabled=True),
+        },
+        use_container_width=True, hide_index=True, key="tbl_editor",
+    )
+
+    if st.button("Salvar categorias editadas", key="tbl_save"):
+        changed = 0
+        for tx_hash, new_cat in edited["category"].items():
+            if new_cat != view.loc[tx_hash, "category"]:
+                db.set_manual_category(conn, tx_hash, new_cat)  # durable: category_source='manual'
+                changed += 1
+        if changed:
+            _bump_data_version()
+            st.success(f"{changed} categoria(s) atualizada(s) manualmente.")
+            st.rerun()
+        else:
+            st.info("Nenhuma alteração para salvar.")
+
+    csv_bytes = df.assign(date=df["date"].dt.strftime("%Y-%m-%d")).to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Exportar visão filtrada (CSV)", data=csv_bytes,
+        file_name=f"transacoes_{currency}.csv", mime="text/csv", key="tbl_export",
+    )
+
+
+def _dashboard_page() -> None:
+    conn = _get_db_connection()
+    if db.count_transactions(conn) == 0:
+        st.title("📊 Painel financeiro")
+        st.info("Você ainda não importou transações. Vá para **Atualizar transações** para adicionar seus extratos.")
+        return
+    _render_dashboard(conn)
+
+
+# ---------------------------------------------------------------------------
+# PAGE: Atualizar transações (incremental import)
+# ---------------------------------------------------------------------------
+def _process_incremental_files(profile: AccountProfile, files: list) -> tuple[pd.DataFrame, list[str]]:
+    """Process each uploaded file with the account's saved profile.
+
+    Files whose schema_fingerprint does not match are skipped with a pt_BR
+    warning unless the user forces application (checkbox). Returns the combined
+    canonical frame and a list of warnings.
+    """
+    frames: list[pd.DataFrame] = []
+    warnings: list[str] = []
+    for uploaded in files:
+        data = uploaded.getvalue()
+        detected = _detect_source_type(uploaded.name)
+        # Legacy profiles may have no source_type; infer it from the file then.
+        if profile.source_type is not None and detected != profile.source_type:
+            warnings.append(
+                f"'{uploaded.name}': tipo de arquivo difere do perfil salvo "
+                f"({profile.source_type}); arquivo ignorado."
+            )
+            continue
+        eff_source = profile.source_type or detected
+        columns = _sample_columns_for(profile, data, eff_source)
+        if profile.schema_fingerprint is None:
+            # Legacy profile without a recorded fingerprint: apply it directly.
+            matches = True
+        else:
+            matches = columns is not None and (
+                csv_mapper.compute_schema_fingerprint(columns) == profile.schema_fingerprint
+            )
+        if not matches:
+            st.warning(
+                f"'{uploaded.name}': as colunas não correspondem ao perfil salvo desta conta."
+            )
+            force = st.checkbox(
+                f"Aplicar o perfil salvo mesmo assim em '{uploaded.name}'", key=f"force_{uploaded.name}"
+            )
+            st.caption("Para remapear as colunas, use **Configurações → editar/recriar a conta**.")
+            if not force:
+                warnings.append(f"'{uploaded.name}': ignorado (colunas divergentes).")
+                continue
+        try:
+            frame = csv_mapper.process_csv(_full_csv_bytes_for(profile, data, eff_source), profile)
+            frames.append(frame)
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"'{uploaded.name}': falha ao processar ({exc}).")
+    combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=csv_mapper.CANONICAL_COLUMNS)
+    return combined, warnings
+
+
+def _render_incremental_update(conn: sqlite3.Connection) -> None:
+    """Incremental import into an EXISTING account (no account creation here)."""
+    st.title("⬆️ Atualizar transações")
+    accounts = db.list_all_accounts(conn)
+    if not accounts:
+        st.info("Nenhuma conta cadastrada. Crie uma conta em **Configurações**.")
+        return
+
+    account_id = st.selectbox("Conta", accounts, key="upd_account")
+    profile = csv_mapper.load_profile(account_id)
+    if profile is None:
+        st.error(f"Perfil de importação da conta '{account_id}' não encontrado. Recrie-o em Configurações.")
+        return
+
+    files = st.file_uploader(
+        "Enviar um ou mais extratos", type=["csv", "xls", "xlsx", "pdf"],
+        accept_multiple_files=True, key="upd_files",
+    )
+    if not files:
+        return
+
+    combined, warnings = _process_incremental_files(profile, files)
+    if combined.empty:
+        for w in warnings:
+            st.warning(w)
+        st.info("Nenhuma transação processável nos arquivos enviados.")
+        return
+
+    # ---- Pre-import summary (BEFORE writing anything) ----
+    date_iso = combined["date"].dt.strftime("%Y-%m-%d")
+    ex_hashes = db.existing_hashes(conn, account_id, date_iso.min(), date_iso.max())
+    plan = import_service.build_import_plan(
+        combined, ex_hashes, db.account_date_range(conn, account_id), account_id, warnings,
+    )
+
+    st.header("Resumo da importação (pré-visualização)")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Linhas processadas", plan.total_rows)
+    m2.metric("Novas", plan.new_rows)
+    m3.metric("Já no banco (ignoradas)", plan.duplicate_rows)
+    m4.metric("Transferências internas", plan.internal_transfer_rows)
+    st.caption(f"Intervalo detectado: {plan.min_date} a {plan.max_date}.")
+    if plan.overlaps_existing:
+        st.info(f"Este intervalo sobrepõe o histórico existente da conta "
+                f"({plan.existing_min_date} a {plan.existing_max_date}).")
+    for w in plan.warnings:
+        st.warning(w)
+
+    if plan.duplicate_rows:
+        with st.expander(f"Ver {plan.duplicate_rows} linha(s) que seriam ignoradas como duplicatas"):
+            dup_view = combined[combined["transaction_hash"].isin(ex_hashes)]
+            st.dataframe(dup_view[["date", "description", "amount", "currency"]], use_container_width=True)
+
+    # ---- Legitimate-collision decisions ----
+    distinct_hashes: set[str] = set()
+    if plan.collision_groups:
+        st.subheader("Possíveis duplicatas legítimas")
+        st.caption(
+            "Estas linhas do arquivo compartilham o mesmo identificador "
+            "(mesma conta, data, valor e descrição). Decida por grupo:"
+        )
+        for i, group in enumerate(plan.collision_groups):
+            choice = st.radio(
+                f"{group.count}× {group.date_iso} · {group.description} · {group.amount:.2f} {group.currency}",
+                ["Tratar como a MESMA transação (importar 1)",
+                 "Tratar como transações DISTINTAS (importar todas)"],
+                key=f"collision_{i}",
+            )
+            if choice.startswith("Tratar como transações DISTINTAS"):
+                distinct_hashes.add(group.transaction_hash)
+
+    if st.button("Confirmar importação", key="upd_confirm"):
+        to_insert = import_service.apply_collision_decisions(combined, distinct_hashes)
+        inserted = db.insert_transactions(conn, to_insert)
+        ignored = len(to_insert) - inserted
+        st.session_state["last_import_hashes"] = tuple(to_insert["transaction_hash"])
+        st.session_state["last_import_account"] = account_id
+        _bump_data_version()
+        st.success(f"Importação concluída: {inserted} inseridas, {ignored} ignoradas como duplicatas.")
+
+    # ---- Categorize ONLY the newly inserted rows ----
+    if st.session_state.get("last_import_account") == account_id and st.session_state.get("last_import_hashes"):
+        if st.button("Categorizar novas transações com IA", key="upd_cat"):
+            n = _categorize_hashes(conn, st.session_state["last_import_hashes"])
+            if n:
+                st.success(f"{n} novas transações categorizadas.")
+
+
+def _update_page() -> None:
+    _render_incremental_update(_get_db_connection())
+
+
+# ---------------------------------------------------------------------------
+# PAGE: Configurações
+# ---------------------------------------------------------------------------
+def _render_settings(conn: sqlite3.Connection) -> None:
+    st.title("⚙️ Configurações")
+
+    st.header("Contas")
+    stats = db.account_stats(conn)
+    if stats:
+        st.dataframe(pd.DataFrame(stats).rename(columns={
+            "account_id": "Conta", "account_type": "Tipo", "bank_name": "Banco",
+            "tx_count": "Transações", "min_date": "Início", "max_date": "Fim",
+        }), use_container_width=True)
+
+    if st.button("➕ Nova conta (importar novo banco)", key="cfg_new_account"):
+        _reset_pipeline_state()
+        st.session_state["uploaded_sig"] = None
+        st.session_state["onboarding_active"] = True
+        st.rerun()
+
+    # ---- Delete account ----
+    st.subheader("Excluir conta")
+    accounts = db.list_all_accounts(conn)
+    if accounts:
+        target = st.selectbox("Conta a excluir", accounts, key="cfg_del_account")
+        st.warning(
+            f"Excluir a conta '{target}' remove TAMBÉM todas as suas transações. Esta ação é irreversível."
+        )
+        typed = st.text_input(f"Digite '{target}' para confirmar", key="cfg_del_confirm")
+        if st.button("Excluir conta permanentemente", key="cfg_del_btn"):
+            if typed == target:
+                removed = db.delete_account(conn, target)
+                csv_mapper.delete_profile(target)
+                _bump_data_version()
+                st.success(f"Conta '{target}' excluída ({removed} transações removidas).")
+                st.rerun()
+            else:
+                st.error("Confirmação não corresponde ao identificador da conta.")
+
+    # ---- Import profiles ----
+    st.header("Perfis de importação salvos")
+    profiles = csv_mapper.list_profiles()
+    if profiles:
+        prof_target = st.selectbox("Perfil", profiles, key="cfg_profile")
+        loaded = csv_mapper.load_profile(prof_target)
+        if loaded is not None:
+            st.json(loaded.to_dict())
+        if st.button("Excluir perfil salvo", key="cfg_profile_del"):
+            csv_mapper.delete_profile(prof_target)
+            st.success(f"Perfil '{prof_target}' excluído.")
+            st.rerun()
+    else:
+        st.caption("Nenhum perfil salvo.")
+
+    # ---- Category taxonomy ----
+    st.header("Categorias")
+    st.write(", ".join(db.list_all_categories(conn)))
+    new_cat = st.text_input("Adicionar categoria", key="cfg_new_cat")
+    if st.button("Adicionar", key="cfg_add_cat") and new_cat.strip():
+        db.add_category(conn, new_cat.strip())
+        st.success(f"Categoria '{new_cat.strip()}' adicionada.")
+        st.rerun()
+
+    # ---- Budgets ----
+    st.header("Orçamentos")
+    currencies = db.list_currencies(conn) or [c.value for c in Currency]
+    budget_currency = st.selectbox("Moeda do orçamento", currencies, key="cfg_budget_currency")
+    current_budgets = db.get_budgets(conn, budget_currency)
+    cat = st.selectbox("Categoria", db.list_all_categories(conn), key="cfg_budget_cat")
+    amount = st.number_input(
+        "Valor orçado", min_value=0.0, step=50.0,
+        value=float(current_budgets.get(cat, 0.0)), key="cfg_budget_amount",
+    )
+    b1, b2 = st.columns(2)
+    if b1.button("Salvar orçamento", key="cfg_budget_save"):
+        db.set_budget(conn, cat, budget_currency, amount)
+        _bump_data_version()
+        st.success(f"Orçamento de '{cat}' ({budget_currency}) salvo.")
+        st.rerun()
+    if b2.button("Remover orçamento", key="cfg_budget_del"):
+        db.delete_budget(conn, cat, budget_currency)
+        _bump_data_version()
+        st.success(f"Orçamento de '{cat}' ({budget_currency}) removido.")
+        st.rerun()
+    if current_budgets:
+        st.dataframe(
+            pd.DataFrame([{"Categoria": k, "Orçado": v} for k, v in sorted(current_budgets.items())]),
+            use_container_width=True,
+        )
+
+
+def _settings_page() -> None:
+    _render_settings(_get_db_connection())
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+def main() -> None:
+    """Route: onboarding when no accounts (or 'Nova conta'); else 3-page nav."""
+    st.set_page_config(page_title="Gestão Financeira Pessoal", layout="wide")
+    init_session_state()
+    conn = _get_db_connection()
+
+    if db.count_accounts(conn) == 0 or st.session_state.get("onboarding_active"):
+        st.session_state["onboarding_active"] = True
+        render_onboarding()
+        return
+
+    navigation = st.navigation([
+        st.Page(_dashboard_page, title="Dashboard", icon="📊", default=True),
+        st.Page(_update_page, title="Atualizar transações", icon="⬆️"),
+        st.Page(_settings_page, title="Configurações", icon="⚙️"),
+    ])
+    navigation.run()
 
 
 if __name__ == "__main__":

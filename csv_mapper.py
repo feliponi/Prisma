@@ -118,6 +118,24 @@ def save_profile(profile: AccountProfile, mappings_dir: Path = DEFAULT_MAPPINGS_
     return path
 
 
+def delete_profile(account_id: str, mappings_dir: Path = DEFAULT_MAPPINGS_DIR) -> bool:
+    """Delete a saved account profile file, if present.
+
+    Args:
+        account_id: The account whose `{account_id}_config.json` to remove.
+        mappings_dir: Directory containing the profile files.
+
+    Returns:
+        True if a file was deleted, False if none existed.
+    """
+    path = _profile_path(account_id, mappings_dir)
+    if path.exists():
+        path.unlink()
+        logger.info("Deleted profile for account '%s'", account_id)
+        return True
+    return False
+
+
 def compute_schema_fingerprint(columns: list[str]) -> str:
     """Compute a stable fingerprint of a file's column set for profile reuse.
 
@@ -135,11 +153,9 @@ def compute_schema_fingerprint(columns: list[str]) -> str:
 
     Returns:
         A 64-character lowercase hex SHA-256 digest.
-
-    Raises:
-        NotImplementedError: Phase 2 implementation pending.
     """
-    raise NotImplementedError
+    joined = "\n".join(sorted(columns))
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 
 def find_profile_by_fingerprint(
@@ -156,12 +172,15 @@ def find_profile_by_fingerprint(
         mappings_dir: Directory containing `{account_id}_config.json` files.
 
     Returns:
-        The first matching `AccountProfile`, or None if none match.
-
-    Raises:
-        NotImplementedError: Phase 2 implementation pending.
+        The first matching `AccountProfile` (by account_id order), or None.
     """
-    raise NotImplementedError
+    if not fingerprint:
+        return None
+    for account_id in list_profiles(mappings_dir):
+        profile = load_profile(account_id, mappings_dir)
+        if profile is not None and profile.schema_fingerprint == fingerprint:
+            return profile
+    return None
 
 
 def process_csv(raw_bytes: bytes, profile: AccountProfile) -> pd.DataFrame:
